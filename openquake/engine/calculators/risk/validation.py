@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2013, GEM Foundation.
+# Copyright (c) 2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -22,6 +22,7 @@ Custom validation module for risk calculators
 """
 
 from openquake.engine.db import models
+from openquake.commonlib.readinput import get_imtls
 
 
 class Validator(object):
@@ -41,8 +42,8 @@ class HazardIMT(Validator):
     intensity measure types given in the risk models
     """
     def get_error(self):
-        model_imts = models.required_imts(self.calc.risk_models)
-        imts = self.calc.hc.get_imts()
+        model_imts = set(imt for (imt, taxo) in self.calc.risk_models)
+        imts = sorted(get_imtls(self.calc.rc.get_hazard_param()))
 
         # check that the hazard data have all the imts needed by the
         # risk calculation
@@ -73,7 +74,8 @@ class OrphanTaxonomies(Validator):
     """
     def get_error(self):
         taxonomies = self.calc.taxonomies_asset_count
-        orphans = set(taxonomies) - set(self.calc.risk_models)
+        orphans = set(taxonomies) - set(
+            taxo for imt, taxo in self.calc.risk_models)
         if orphans and not self.calc.rc.taxonomies_from_model:
             return ('The following taxonomies are in the exposure model '
                     'but not in the risk model: %s' % orphans)
@@ -85,9 +87,7 @@ class ExposureLossTypes(Validator):
     types given in the risk models
     """
     def get_error(self):
-        loss_types = models.loss_types(self.calc.risk_models)
-
-        for loss_type in loss_types:
+        for loss_type in self.calc.loss_types:
             if not self.calc.rc.exposure_model.supports_loss_type(loss_type):
                 return ("Invalid exposure "
                         "for computing loss type %s. " % loss_type)
@@ -106,12 +106,11 @@ class RequireClassicalHazard(Validator):
     """
     def get_error(self):
         rc = self.calc.rc
-
-        if rc.hazard_calculation:
-            if rc.hazard_calculation.calculation_mode != 'classical':
-                return ("The provided hazard calculation ID "
-                        "is not a classical calculation")
-        elif not rc.hazard_output.is_hazard_curve():
+        hazard_output = rc.hazard_outputs()[0]
+        if rc.get_hazard_param().calculation_mode != 'classical':
+            return ("The provided hazard calculation ID "
+                    "is not a classical calculation")
+        elif not hazard_output.is_hazard_curve():
             return "The provided hazard output is not an hazard curve"
 
 
@@ -122,12 +121,11 @@ class RequireScenarioHazard(Validator):
     """
     def get_error(self):
         rc = self.calc.rc
-
-        if rc.hazard_calculation:
-            if rc.hazard_calculation.calculation_mode != "scenario":
-                return ("The provided hazard calculation ID "
-                        "is not a scenario calculation")
-        elif not rc.hazard_output.output_type == "gmf_scenario":
+        hazard_output = rc.hazard_outputs()[0]
+        if rc.get_hazard_param().calculation_mode != 'scenario':
+            return ("The provided hazard calculation ID "
+                    "is not a scenario calculation")
+        elif not hazard_output.output_type == "gmf_scenario":
             return "The provided hazard is not a gmf scenario collection"
 
 
@@ -138,19 +136,16 @@ class RequireEventBasedHazard(Validator):
     """
     def get_error(self):
         rc = self.calc.rc
-
-        if rc.hazard_calculation:
-            if rc.hazard_calculation.calculation_mode != "event_based":
-                return ("The provided hazard calculation ID "
-                        "is not a event based calculation")
-        elif not rc.hazard_output.output_type in ["gmf", "ses"]:
+        hazard_output = rc.hazard_outputs()[0]
+        if rc.get_hazard_param().calculation_mode != "event_based":
+            return ("The provided hazard calculation ID "
+                    "is not a event based calculation")
+        if not hazard_output.output_type in ["gmf", "ses"]:
             return "The provided hazard is not a gmf or ses collection"
 
-        if rc.hazard_outputs()[0].output_type == "ses":
-            if 'source_model_logic_tree' not in rc.inputs:
-                return ("source_model_logic_tree_file and "
-                        "gsim_logic_tree_file "
-                        "is mandatory "
+        if hazard_output.output_type == "ses":
+            if 'gsim_logic_tree' not in rc.inputs:
+                return ("gsim_logic_tree_file is mandatory "
                         "when the hazard output is a ses collection")
 
 
@@ -162,7 +157,7 @@ class ExposureHasInsuranceBounds(Validator):
 
     def get_error(self):
         if (self.calc.rc.insured_losses and
-            not self.calc.rc.exposure_model.has_insurance_bounds()):
+                not self.calc.rc.exposure_model.has_insurance_bounds()):
             return "Deductible or insured limit missing in exposure"
 
 
@@ -182,7 +177,7 @@ class ExposureHasTimeEvent(Validator):
     """
 
     def get_error(self):
-        if (self.calc.rc.vulnerability_input("occupants") is not None and
+        if (self.calc.rc.inputs.get("occupants") is not None and
             not self.calc.rc.exposure_model.has_time_event(
                 self.calc.rc.time_event)):
             return ("Some assets are missing an "

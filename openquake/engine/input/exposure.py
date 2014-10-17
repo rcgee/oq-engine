@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -43,7 +43,7 @@ class ExposureDBWriter(object):
     def serialize(self, iterator):
         """
         Serialize a list of values produced by iterating over an instance of
-        :class:`openquake.nrmllib.risk.parsers.ExposureParser`
+        :class:`openquake.commonlib.risk_parsers.ExposureParser`
         """
         for asset_data in iterator:
             if not self.model:
@@ -63,7 +63,7 @@ class ExposureDBWriter(object):
 
         :param model:
             an instance of
-            :class:`openquake.nrmllib.risk.parsers.ExposureMetadata`
+            :class:`openquake.commonlib.risk_parsers.ExposureMetadata`
         """
         exposure_model = models.ExposureModel.objects.create(
             job=self.job,
@@ -94,7 +94,7 @@ class ExposureDBWriter(object):
         Insert a single asset entry.
 
         :param asset_data:
-            an instance of :class:`openquake.nrmllib.risk.parsers.AssetData`
+            an instance of :class:`openquake.commonlib.risk_parsers.AssetData`
         """
         asset = models.ExposureData.objects.create(
             exposure_model=self.model,

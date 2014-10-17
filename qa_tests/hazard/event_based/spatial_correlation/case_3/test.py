@@ -1,4 +1,4 @@
-# Copyright (c) 2013, GEM Foundation.
+# Copyright (c) 2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -28,7 +28,7 @@ class EBHazardSpatialCorrelCase3TestCase(qa_utils.BaseQATestCase):
         cfg = os.path.join(os.path.dirname(__file__), 'job.ini')
 
         job = self.run_hazard(cfg)
-        hc = job.hazard_calculation
+        hc = job.get_oqparam()
 
         site_1 = 'POINT(0.0 0.0)'
         site_2 = 'POINT(0.008993 0.0)'

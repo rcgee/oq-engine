@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -36,7 +36,7 @@ def _db_cfg(db_name):
 
     :returns: Configuration dict, structured like so::
         {'ENGINE': 'django.db.backends.postgresql_psycopg2',
-         'NAME': 'openquake',
+         'NAME': 'openquake2',
          'USER': 'openquake',
          'PASSWORD': 'secret',
          'HOST': 'localhost',
@@ -92,3 +92,8 @@ SECRET_KEY = 'change-me-in-production'
 
 USE_I18N = False
 USE_L10N = False
+
+try:
+    from local_settings import *
+except ImportError:
+    pass

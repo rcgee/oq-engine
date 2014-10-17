@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -13,9 +13,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
 
-
+import os
 import getpass
 import unittest
+import mock
 
 import numpy
 
@@ -23,9 +24,7 @@ from nose.plugins.attrib import attr
 
 from openquake.engine.calculators.hazard.classical import core
 from openquake.engine.db import models
-from openquake.engine.engine import save_job_stats
 from openquake.engine.tests.utils import helpers
-from openquake.engine.utils.general import WeightedSequence
 
 
 class ClassicalHazardCalculatorTestCase(unittest.TestCase):
@@ -44,130 +43,87 @@ class ClassicalHazardCalculatorTestCase(unittest.TestCase):
         return job, calc
 
     def test_initialize_sources(self):
-        self.calc.initialize_site_model()
+        self.calc.initialize_site_collection()
         self.calc.initialize_sources()
-        # after splitting/grouping the source model contains 22 blocks
-        blocks = self.calc.source_blocks_per_ltpath[('b1',)]
-        self.assertEqual(21, len(blocks))
-
-    @attr('slow')
-    def test_initialize_site_model(self):
-        # we need a slightly different config file for this test
-        cfg = helpers.get_data_path(
-            'simple_fault_demo_hazard/job_with_site_model.ini')
-        self.job = helpers.get_job(cfg)
-        self.calc = core.ClassicalHazardCalculator(self.job)
-
-        self.calc.initialize_site_model()
-        # If the site model isn't valid for the calculation geometry, a
-        # `RuntimeError` should be raised here
-
-        # Okay, it's all good. Now check the count of the site model records.
-        sm_nodes = models.SiteModel.objects.filter(job=self.job)
-
-        self.assertEqual(2601, len(sm_nodes))
-
-        num_pts_to_compute = len(
-            self.job.hazard_calculation.points_to_compute())
-
-        hazard_site = models.HazardSite.objects.filter(
-            hazard_calculation=self.job.hazard_calculation)
-
-        # The site model is good. Now test that `hazard_site` was computed.
-        # For now, just test the length.
-        self.assertEqual(num_pts_to_compute, len(hazard_site))
-
-    def test_initialize_site_model_no_site_model(self):
-        patch_path = 'openquake.engine.calculators.hazard.general.\
-store_site_model'
-        with helpers.patch(patch_path) as store_sm_patch:
-            self.calc.initialize_site_model()
-            # We should never try to store a site model in this case.
-            self.assertEqual(0, store_sm_patch.call_count)
-
-    def _check_logic_tree_realization_source_blocks_per_ltpath(self, ltr):
-        # the logic tree for this sample calculation only contains a single
-        # source model
-        path = tuple(ltr.sm_lt_path)
-        sources = WeightedSequence.merge(
-            self.calc.source_blocks_per_ltpath[path])
-        self.assertEqual(22, len(sources))
+        # there is a single model
+        [collector] = self.calc.source_collector.values()
+        # before filtering and splitting there are 118 sources
+        self.assertEqual(118, len(collector.sources))
 
     def test_initialize_realizations_montecarlo(self):
-        # We need initalize sources first (read logic trees, parse sources,
+        # We need initialize sources first (read logic trees, parse sources,
         # etc.)
-        self.calc.initialize_site_model()
+        self.calc.initialize_site_collection()
         self.calc.initialize_sources()
 
         # No realizations yet:
         ltrs = models.LtRealization.objects.filter(
-            hazard_calculation=self.job.hazard_calculation.id)
+            lt_model__hazard_calculation=self.job)
         self.assertEqual(0, len(ltrs))
 
-        self.calc.initialize_realizations()
+        self.calc.process_sources()
+
+        with mock.patch('openquake.engine.logs.LOG.warn') as warn:
+            self.calc.initialize_realizations()
+        # check that the warning about too many samples is printed
+        msg, num_rlzs, num_samples = warn.call_args[0]
+        self.assertEqual(num_rlzs, 1)
+        self.assertEqual(num_samples, 2)
 
         # We expect 2 logic tree realizations
         ltr1, ltr2 = models.LtRealization.objects.filter(
-            hazard_calculation=self.job.hazard_calculation.id).order_by("id")
+            lt_model__hazard_calculation=self.job).order_by("id")
 
         # Check each ltr contents, just to be thorough.
         self.assertEqual(0, ltr1.ordinal)
-        self.assertEqual(23, ltr1.seed)
         self.assertEqual(['b1'], ltr1.sm_lt_path)
         self.assertEqual(['b1'], ltr1.gsim_lt_path)
 
         self.assertEqual(1, ltr2.ordinal)
-        self.assertEqual(1685488378, ltr2.seed)
         self.assertEqual(['b1'], ltr2.sm_lt_path)
         self.assertEqual(['b1'], ltr2.gsim_lt_path)
 
-        for ltr in (ltr1, ltr2):
-            self._check_logic_tree_realization_source_blocks_per_ltpath(ltr)
-
     def test_initialize_realizations_enumeration(self):
-        self.calc.initialize_site_model()
-        self.calc.initialize_sources()
+        self.calc.initialize_site_collection()
         # enumeration is triggered by zero value used as number of realizations
-        self.calc.job.hazard_calculation.number_of_logic_tree_samples = 0
+        self.calc.hc.number_of_logic_tree_samples = 0
+
+        self.calc.initialize_sources()
+        self.calc.process_sources()
         self.calc.initialize_realizations()
 
         [ltr] = models.LtRealization.objects.filter(
-            hazard_calculation=self.job.hazard_calculation.id)
+            lt_model__hazard_calculation=self.job)
 
         # Check each ltr contents, just to be thorough.
         self.assertEqual(0, ltr.ordinal)
-        self.assertEqual(None, ltr.seed)
         self.assertEqual(['b1'], ltr.sm_lt_path)
         self.assertEqual(['b1'], ltr.gsim_lt_path)
-
-        self._check_logic_tree_realization_source_blocks_per_ltpath(ltr)
 
     @attr('slow')
     def test_complete_calculation_workflow(self):
         # Test the calculation workflow, from pre_execute through clean_up
-        hc = self.job.hazard_calculation
+        hc = self.job.get_oqparam()
 
         self.calc.pre_execute()
-        save_job_stats(self.job)
-
-        # Test the job stats:
-        job_stats = models.JobStats.objects.get(oq_job=self.job.id)
-        # num sources * num lt samples / block size (items per task):
-        self.assertEqual(120, job_stats.num_sites)
 
         # Update job status to move on to the execution phase.
         self.job.is_running = True
-
         self.job.status = 'executing'
         self.job.save()
         self.calc.execute()
+
+        # there is a single model
+        [collector] = self.calc.source_collector.values()
+        # after filtering there are 74 sources
+        self.assertEqual(74, len(collector.sources))
 
         self.job.status = 'post_executing'
         self.job.save()
         self.calc.post_execute()
 
         lt_rlzs = models.LtRealization.objects.filter(
-            hazard_calculation=self.job.hazard_calculation.id)
+            lt_model__hazard_calculation=self.job)
 
         self.assertEqual(2, len(lt_rlzs))
 
@@ -270,8 +226,9 @@ store_site_model'
 
         self.job.status = 'clean_up'
         self.job.save()
-        self.calc.clean_up()
-        self.assertEqual(0, len(self.calc.source_blocks_per_ltpath))
+
+        # now test the hazard calculation can be removed
+        self.job.delete(using='admin')
 
 
 def update_result_matrix(current, new):
@@ -305,3 +262,19 @@ class HelpersTestCase(unittest.TestCase):
 
         expected = numpy.array([0.44] * 16).reshape((4, 4))
         numpy.testing.assert_allclose(expected, result)
+
+
+class NoSourcesTestCase(unittest.TestCase):
+    def test(self):
+        cfg = helpers.get_data_path('classical_job.ini')
+        with mock.patch.dict(os.environ, {'OQ_NO_DISTRIBUTE': '1'}), \
+                mock.patch('openquake.engine.logs.LOG.warn') as warn:
+
+            # using a small maximum distance of 1 km, so that no sources
+            # are found, and checking that no realizations are generated
+            calc = helpers.run_job(cfg, maximum_distance=1)
+            self.assertEqual(warn.call_args[0][0],
+                             'No realizations for hazard_calculation_id=%d')
+
+            # check that the attribute quantile_hazard_curves is empty
+            self.assertEqual(calc.quantile_hazard_curves, ())

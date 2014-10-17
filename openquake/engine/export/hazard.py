@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -19,13 +19,13 @@ Functionality for exporting and serializing hazard curve calculation results.
 
 
 import os
+import csv
 import functools
 
 from collections import namedtuple
-from collections import OrderedDict
 
 from openquake.hazardlib.calc import disagg
-from openquake.nrmllib.hazard import writers
+from openquake.commonlib import hazard_writers
 
 from openquake.engine.db import models
 from openquake.engine.export import core
@@ -74,7 +74,7 @@ def _get_result_export_dest(calc_id, target, result, file_ext='xml'):
 
     :param int calc_id:
         ID of the associated
-        :class:`openquake.engine.db.models.HazardCalculation`.
+        :class:`openquake.engine.db.models.OqJob`.
     :param target:
         Destination directory location for exported files OR a file-like
         object. If file-like, we just simply return it.
@@ -161,16 +161,9 @@ def _get_result_export_dest(calc_id, target, result, file_ext='xml'):
             )
     elif output_type == 'ses':
         sm_ltp = core.LT_PATH_JOIN_TOKEN.join(result.sm_lt_path)
-        if result.weight is None:
-            # Monte-Carlo logic tree sampling
-            filename = '%s-smltp_%s-ltr_%s.%s' % (
-                output_type, sm_ltp, result.ordinal, file_ext
-            )
-        else:
-            # End Branch Enumeration
-            filename = '%s-smltp_%s.%s' % (
-                output_type, sm_ltp, file_ext
-            )
+        filename = '%s-smltp_%s.%s' % (
+            output_type, sm_ltp, file_ext
+        )
     elif output_type == 'disagg_matrix':
         # only logic trees, no stats
 
@@ -215,11 +208,11 @@ def _export_hazard_curve(output, target, export_type):
 
     hcd = _curve_data(hc)
     metadata = _curve_metadata(output, target)
-    haz_calc = output.oq_job.hazard_calculation
+    haz_calc = output.oq_job
     dest = _get_result_export_dest(
         haz_calc.id, target, hc, file_ext=export_type)
-    writercls = writers.HazardCurveGeoJSONWriter \
-        if export_type == 'geojson' else writers.HazardCurveXMLWriter
+    writercls = hazard_writers.HazardCurveGeoJSONWriter \
+        if export_type == 'geojson' else hazard_writers.HazardCurveXMLWriter
     writercls(dest, **metadata).serialize(hcd)
 
     return dest
@@ -234,6 +227,25 @@ export_hazard_curve_geojson = functools.partial(
 
 
 @core.makedirsdeco
+def export_hazard_curve_csv(output, target):
+    """
+    Save a hazard curve (of a given IMT) as a .csv file in the format
+    (lon lat poe1 ... poeN), where the fields are space separated.
+    """
+    hc = models.HazardCurve.objects.get(output=output.id)
+    haz_calc_id = output.oq_job.id
+    dest = _get_result_export_dest(haz_calc_id, target, hc, file_ext='csv')
+    x_y_poes = models.HazardCurveData.objects.all_curves_simple(
+        filter_args=dict(hazard_curve=hc.id))
+    with open(dest, 'wb') as f:
+        writer = csv.writer(f, delimiter=' ')
+        for x, y, poes in sorted(x_y_poes):
+            writer.writerow([x, y] + poes)
+
+    return dest
+
+
+@core.makedirsdeco
 def export_hazard_curve_multi_xml(output, target):
     hcs = output.hazard_curve
 
@@ -244,10 +256,10 @@ def export_hazard_curve_multi_xml(output, target):
         metadata = _curve_metadata(hc.output, target)
         metadata_set.append(metadata)
 
-    haz_calc = output.oq_job.hazard_calculation
+    haz_calc = output.oq_job
     dest = _get_result_export_dest(haz_calc.id, target, hcs)
 
-    writer = writers.MultiHazardCurveXMLWriter(dest, metadata_set)
+    writer = hazard_writers.MultiHazardCurveXMLWriter(dest, metadata_set)
     writer.serialize(data)
 
     return dest
@@ -304,19 +316,19 @@ def export_gmf_xml(output, target):
     :returns:
         The same return value as defined by :func:`export`.
     """
-    gmf_coll = models.Gmf.objects.get(output=output.id)
-    lt_rlz = gmf_coll.lt_realization
-    haz_calc = output.oq_job.hazard_calculation
+    gmf = models.Gmf.objects.get(output=output.id)
+    lt_rlz = gmf.lt_realization
+    haz_calc = output.oq_job
 
     sm_lt_path = core.LT_PATH_JOIN_TOKEN.join(lt_rlz.sm_lt_path)
     gsim_lt_path = core.LT_PATH_JOIN_TOKEN.join(lt_rlz.gsim_lt_path)
 
     dest = _get_result_export_dest(haz_calc.id, target, output.gmf)
 
-    writer = writers.EventBasedGMFXMLWriter(
+    writer = hazard_writers.EventBasedGMFXMLWriter(
         dest, sm_lt_path, gsim_lt_path)
 
-    writer.serialize(gmf_coll)
+    writer.serialize(gmf)
 
     return dest
 
@@ -335,11 +347,15 @@ def export_gmf_scenario_xml(output, target):
     :returns:
         The same return value as defined by :func:`export`.
     """
-    haz_calc = output.oq_job.hazard_calculation
+    gmf = models.Gmf.objects.get(output=output.id)
+    haz_calc = output.oq_job
+
     dest = _get_result_export_dest(haz_calc.id, target, output.gmf)
-    gmfs = models.get_gmfs_scenario(output)
-    writer = writers.ScenarioGMFXMLWriter(dest)
-    writer.serialize(gmfs)
+
+    writer = hazard_writers.EventBasedGMFXMLWriter(
+        dest, sm_lt_path='', gsim_lt_path='')
+    writer.serialize(gmf)
+
     return dest
 
 
@@ -360,13 +376,13 @@ def export_ses_xml(output, target):
         file).
     """
     ses_coll = models.SESCollection.objects.get(output=output.id)
-    haz_calc = output.oq_job.hazard_calculation
+    haz_calc = output.oq_job
     sm_lt_path = core.LT_PATH_JOIN_TOKEN.join(ses_coll.sm_lt_path)
 
     dest = _get_result_export_dest(haz_calc.id, target,
                                    output.ses)
 
-    writer = writers.SESXMLWriter(dest, sm_lt_path)
+    writer = hazard_writers.SESXMLWriter(dest, sm_lt_path)
     writer.serialize(ses_coll)
 
     return dest
@@ -377,7 +393,7 @@ def _export_hazard_map(output, target, writer_class, file_ext):
     General hazard map export code.
     """
     hazard_map = models.HazardMap.objects.get(output=output)
-    haz_calc = output.oq_job.hazard_calculation
+    haz_calc = output.oq_job
 
     if hazard_map.lt_realization is not None:
         # If the maps are for a specified logic tree realization,
@@ -425,8 +441,8 @@ def export_hazard_map_xml(output, target):
         A list of exported file name (including the absolute path to each
         file).
     """
-    return _export_hazard_map(output, target, writers.HazardMapXMLWriter,
-                              'xml')
+    return _export_hazard_map(
+        output, target, hazard_writers.HazardMapXMLWriter, 'xml')
 
 
 def export_hazard_map_geojson(output, target):
@@ -435,13 +451,13 @@ def export_hazard_map_geojson(output, target):
     in GeoJSON format.
     """
     return _export_hazard_map(output, target,
-                              writers.HazardMapGeoJSONWriter, 'geojson')
+                              hazard_writers.HazardMapGeoJSONWriter, 'geojson')
 
 
 class _DisaggMatrix(object):
     """
     A simple data model into which disaggregation matrix information can be
-    packed. The :class:`openquake.nrmllib.hazard.writers.DisaggXMLWriter`
+    packed. The :class:`openquake.commonlib.hazard_writers.DisaggXMLWriter`
     expects a sequence of objects which match this interface.
 
     :param matrix:
@@ -496,21 +512,10 @@ def export_disagg_matrix_xml(output, target):
     # We expect 1 result per `Output`
     [disagg_result] = models.DisaggResult.objects.filter(output=output)
     lt_rlz = disagg_result.lt_realization
-    haz_calc = output.oq_job.hazard_calculation
+    haz_calc = output.oq_job
 
     dest = _get_result_export_dest(haz_calc.id, target,
                                    output.disagg_matrix)
-
-    pmf_map = OrderedDict([
-        (('Mag', ), disagg.mag_pmf),
-        (('Dist', ), disagg.dist_pmf),
-        (('TRT', ), disagg.trt_pmf),
-        (('Mag', 'Dist'), disagg.mag_dist_pmf),
-        (('Mag', 'Dist', 'Eps'), disagg.mag_dist_eps_pmf),
-        (('Lon', 'Lat'), disagg.lon_lat_pmf),
-        (('Mag', 'Lon', 'Lat'), disagg.mag_lon_lat_pmf),
-        (('Lon', 'Lat', 'TRT'), disagg.lon_lat_trt_pmf),
-    ])
 
     writer_kwargs = dict(
         investigation_time=disagg_result.investigation_time,
@@ -529,11 +534,11 @@ def export_disagg_matrix_xml(output, target):
         gsimlt_path=core.LT_PATH_JOIN_TOKEN.join(lt_rlz.gsim_lt_path),
     )
 
-    writer = writers.DisaggXMLWriter(dest, **writer_kwargs)
+    writer = hazard_writers.DisaggXMLWriter(dest, **writer_kwargs)
 
-    data = (_DisaggMatrix(pmf_fn(disagg_result.matrix), dim_labels,
+    data = (_DisaggMatrix(disagg_result.matrix[i], dim_labels,
                           disagg_result.poe, disagg_result.iml)
-            for dim_labels, pmf_fn in pmf_map.iteritems())
+            for i, dim_labels in enumerate(disagg.pmf_map))
 
     writer.serialize(data)
 
@@ -555,7 +560,7 @@ def export_uh_spectra_xml(output, target):
         A list containing the exported file name.
     """
     uhs = models.UHS.objects.get(output=output)
-    haz_calc = output.oq_job.hazard_calculation
+    haz_calc = output.oq_job
 
     dest = _get_result_export_dest(haz_calc.id, target, output.uh_spectra)
 
@@ -577,7 +582,7 @@ def export_uh_spectra_xml(output, target):
         'investigation_time': uhs.investigation_time,
     }
 
-    writer = writers.UHSXMLWriter(dest, **metadata)
+    writer = hazard_writers.UHSXMLWriter(dest, **metadata)
     writer.serialize(uhs)
 
     return dest

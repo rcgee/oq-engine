@@ -1,4 +1,4 @@
-# Copyright (c) 2013, GEM Foundation.
+# Copyright (c) 2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -29,21 +29,23 @@ class ScenarioOccupantsQATestCase1(risk.FixtureBasedQATestCase):
     def actual_data(self, job):
         latest_loss_map = job.output_set.filter(
             output_type="loss_map", loss_map__loss_type="fatalities").latest(
-                'last_update').loss_map
+            'last_update').loss_map
         latest_aggregated = job.output_set.filter(
             output_type="aggregate_loss",
             aggregate_loss__loss_type="fatalities").latest(
-                'last_update').aggregate_loss
+            'last_update').aggregate_loss
 
-        return [(d.value, d.std_dev)
+        data = [(d.value, d.std_dev)
                 for d in latest_loss_map.lossmapdata_set.all().order_by(
-                'asset_ref')] + [
-                    (latest_aggregated.mean, latest_aggregated.std_dev)]
+                    'asset_ref')] + [
+            (latest_aggregated.mean, latest_aggregated.std_dev)]
+        return data
 
     def expected_data(self):
-        return [(0.40754604, 0.14661467),
-                (1.27516318,  0.91571143),
-                (1.4329613, 0.92721498)] + [(3.11983577,  1.10750248)]
+        return [(0.36863306563175, 0.198942735032192),
+                (1.58950924789158, 1.8570835311939),
+                (1.12788692684151, 0.698151682472273),
+                (3.08602924036484, 1.97594906538496)]
 
 # For NIGHT:
 

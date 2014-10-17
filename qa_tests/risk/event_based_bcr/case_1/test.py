@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -28,23 +28,14 @@ from openquake.engine.db import models
 class EventBasedBCRCase1TestCase(risk.BaseRiskQATestCase):
     output_type = "gmf"
 
-    check_exports = False
-
     @noseattr('qa', 'risk', 'event_based_bcr')
     def test(self):
         self._run_test()
 
     def get_hazard_job(self):
         job = helpers.get_job(
-            helpers.get_data_path("event_based_hazard/job.ini"))
-
-        job.hazard_calculation = models.HazardCalculation.objects.create(
-            truncation_level=job.hazard_calculation.truncation_level,
-            maximum_distance=job.hazard_calculation.maximum_distance,
-            intensity_measure_types_and_levels=(
-                job.hazard_calculation.intensity_measure_types_and_levels),
-            calculation_mode="event_based",
-            investigation_time=50,
+            helpers.get_data_path("event_based_hazard/job.ini"),
+            region=None, region_grid_spacing=None,
             ses_per_logic_tree_path=1)
         job.save()
 
@@ -57,11 +48,10 @@ class EventBasedBCRCase1TestCase(risk.BaseRiskQATestCase):
                  result.average_annual_loss_retrofitted, result.bcr)
                 for result in models.BCRDistributionData.objects.filter(
                     bcr_distribution__output__oq_job=job).order_by(
-                        'asset_ref')]
+                    'asset_ref')]
         return data
 
     def expected_data(self):
-        return [
-            [0.15280346, 0., 26.42475147],
-            [0.31141922, 0., 26.92732075],
-            [0.39231522, 0., 33.92211259]]
+        return [(0.2311358, 0.0, 39.970994),
+                (0.3344297, 0.0, 28.916953),
+                (0.2479981, 0.0, 21.443528)]

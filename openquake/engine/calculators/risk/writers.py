@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright (c) 2013, GEM Foundation.
+# Copyright (c) 2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -249,11 +249,11 @@ def total_damage_distribution(fractions, dmg_state_ids):
 
 OutputKey = collections.namedtuple('OutputKey', [
     'output_type',  # as in :class:`openquake.engine.db.models.Output`
-    'loss_type',  # as in risk output containers
-    'hazard_output_id',  # as in risk output containers
+    'loss_type',  # as in risk output outputdict
+    'hazard_output_id',  # as in risk output outputdict
     'poe',  # for loss map and classical loss fractions
     'quantile',  # for quantile outputs
-    'statistics',  # as in risk output containers
+    'statistics',  # as in risk output outputdict
     'variable',  # for disaggregation outputs
     'insured',  # as in :class:`openquake.engine.db.models.LossCurve`
 ])
@@ -262,7 +262,7 @@ OutputKey = collections.namedtuple('OutputKey', [
 class OutputDict(dict):
     """
     A dict keying OutputKey instances to database ID, with convenience
-    setter and getter methods to manage Output containers.
+    setter and getter methods to manage Output outputdict.
 
     It also automatically links an Output type with its specific
     writer.
@@ -302,7 +302,6 @@ class OutputDict(dict):
         function name given by the `output_type` argument.
         3) Call such function with the given positional arguments.
         """
-
         kwargs.update(self.kwargs)
         output_id = self.get(**kwargs)
         globals().get(kwargs['output_type'])(
@@ -359,9 +358,9 @@ class OutputDict(dict):
             statistics=statistics,
             variable=variable,
             insured=insured)
-        assert super(
-            OutputDict, self).get(
-                key, None) is None, "OutputDict can not be updated"
+
+        assert super(OutputDict, self).get(
+            key, None) is None, "OutputDict can not be updated"
 
         self[key] = container.id
 
@@ -389,13 +388,18 @@ def combine_builders(builders):
         return outputs
 
     a_builder = builders[0]
-
-    loss_types = models.loss_types(a_builder.calc.risk_models)
     hazard_outputs = a_builder.calc.rc.hazard_outputs()
+    # now a special case for event_based_fr
+    if a_builder.calc.rc.calculation_mode == 'event_based_fr':
+        hos = []
+        for ho in hazard_outputs:
+            for rlz in ho.ses.lt_model:
+                gmf = models.Gmf.objects.get(lt_realization=rlz)
+                hos.append(gmf.output)
+        hazard_outputs = hos
 
     for builder in builders:
-        for loss_type in loss_types:
-
+        for loss_type in a_builder.calc.loss_types:
             if len(hazard_outputs) > 1:
                 outputs.extend(builder.statistical_outputs(loss_type))
 
@@ -407,7 +411,7 @@ def combine_builders(builders):
 
 class LossCurveMapBuilder(OutputBuilder):
     """
-    Create output containers for Loss Curves, Insured Loss Curves and
+    Create output outputdict for Loss Curves, Insured Loss Curves and
     Loss Maps
     """
     LOSS_CURVE_TYPE = "loss_curve"

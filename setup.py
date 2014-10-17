@@ -1,6 +1,25 @@
+import re
+import sys
 from setuptools import setup, find_packages
 
-version = "1.0.0"
+
+def get_version():
+    version_re = r"^__version__\s+=\s+['\"]([^'\"]*)['\"]"
+    version = None
+
+    package_init = 'openquake/engine/__init__.py'
+    for line in open(package_init, 'r'):
+        version_match = re.search(version_re, line, re.M)
+        if version_match:
+            version = version_match.group(1)
+            break
+    else:
+        sys.exit('__version__ variable not found in %s' % package_init)
+
+    return version
+
+version = get_version()
+
 url = "http://openquake.org/"
 
 README = """
@@ -11,14 +30,17 @@ Please note: the /usr/bin/openquake script requires a celeryconfig.py
 file in the PYTHONPATH.  Please make sure this is the case and that your
 celeryconfig.py file works with your python-celery setup.
 
-Feel free to copy /usr/openquake/engine/celeryconfig.py and revise it as needed.
+Feel free to copy /usr/openquake/engine/celeryconfig.py and revise it
+as needed.
 """
 
-PY_MODULES = ['openquake.engine.bin.oqscript']
+PY_MODULES = ['openquake.engine.bin.openquake_cli']
 
 setup(
     entry_points={
-        "console_scripts": ["openquake = openquake.engine.bin.oqscript:main"]
+        "console_scripts": [
+            "oq-engine = openquake.engine.bin.openquake_cli:main"
+        ]
     },
     name="openquake.engine",
     version=version,
@@ -42,11 +64,10 @@ setup(
 
     include_package_data=True,
     package_data={"openquake.engine": [
-        "db/schema/*.sql", "db/schema/upgrades/*/*/*.sql",
-        "openquake.cfg", "README", "LICENSE"]},
-    exclude_package_data={"": ["bin/oqpath.py", "bin/oq_check_monitors",
-                               "bin/oq_log_sink"]},
-    scripts=["openquake/engine/bin/oq_create_db"],
+        "db/schema/upgrades/*.sql",
+        "openquake.cfg", "openquake_worker.cfg", "README", "LICENSE"]},
+    scripts=["openquake/engine/bin/oq_create_db",
+             "openquake/engine/bin/openquake"],
 
     namespace_packages=['openquake'],
 

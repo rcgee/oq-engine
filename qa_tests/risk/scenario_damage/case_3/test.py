@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -95,8 +95,8 @@ class ScenarioDamageRiskCase3TestCase(risk.BaseRiskQATestCase):
     def get_hazard_job(self):
         job = helpers.get_job(
             helpers.get_data_path("scenario_hazard/job.ini"))
-        helpers.populate_gmf_data_from_csv(
-            job, self._test_path('../case_1/gmf_scenario.csv'))
+        helpers.create_gmf_from_csv(
+            job, self._test_path('../case_1/gmf_scenario.csv'), 'gmf_scenario')
         return job
 
     def expected_outputs(self):

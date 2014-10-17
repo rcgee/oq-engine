@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -32,7 +32,7 @@ Up-to-date sphinx documentation is at
 This software is licensed under the AGPL license, for more details
 please see the LICENSE file.
 
-Copyright (c) 2010-2013, GEM Foundation.
+Copyright (c) 2010-2014, GEM Foundation.
 
 OpenQuake is free software: you can redistribute it and/or modify it
 under the terms of the GNU Affero General Public License as published
@@ -50,7 +50,6 @@ along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
 import subprocess
-from openquake.engine.utils import general as general_utils
 
 
 def git_suffix():
@@ -66,11 +65,13 @@ def git_suffix():
     py_dir = os.path.dirname(__file__)
     os.chdir(py_dir)
     try:
+        FNULL = open(os.devnull, 'w')
         # with this fix we are missing the case where we are really in git
         # installation scenario but, for some reason, git not works properly
         # and not return the hash but it is an acceptable compromise
-        process = subprocess.Popen(['git', 'rev-parse', '--short', 'HEAD'],
-                                   stdout=subprocess.PIPE, stderr=FNULL)
+        process = subprocess.Popen(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            stdout=subprocess.PIPE, stderr=FNULL)
         output = process.communicate()[0]
         os.chdir(old_dir)
         return "-git" + output
@@ -86,7 +87,7 @@ def git_suffix():
 #  "-" + <pkg-version> + "+dev" + <secs_since_epoch> + "-" + <commit-id>
 # NB: the next line is managed by packager.sh script (we retrieve the version
 #     using sed and optionally replace it)
-__version__ = '1.0.0'
+__version__ = '1.2.0'
 __version__ += git_suffix()
 
 # The path to the OpenQuake root directory
@@ -107,11 +108,8 @@ def no_distribute():
         If the variable is undefined, it defaults to `False`.
     """
     nd = os.environ.get(NO_DISTRIBUTE_VAR)
-
-    if nd is None:
-        return False
-    else:
-        return general_utils.str2bool(nd)
+    if nd:
+        return nd.lower() in ("true", "yes", "t", "1")
 
 
 def set_django_settings_module():

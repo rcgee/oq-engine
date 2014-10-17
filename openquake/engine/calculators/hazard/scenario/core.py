@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -17,102 +17,98 @@
 """
 Scenario calculator core functionality
 """
+import collections
 import random
-from django.db import transaction
-import numpy
-
-from openquake.nrmllib.hazard.parsers import RuptureModelParser
 
 # HAZARDLIB
-from openquake.hazardlib.site import SiteCollection
-from openquake.hazardlib.calc import ground_motion_fields
+from openquake.hazardlib.calc import filters
+from openquake.hazardlib.calc.gmf import GmfComputer
 from openquake.hazardlib.imt import from_string
 import openquake.hazardlib.gsim
+
+from openquake.commonlib.node import read_nodes
+from openquake.commonlib.general import split_in_blocks
+from openquake.commonlib.readinput import get_rupture
 
 from openquake.engine.calculators.hazard import general as haz_general
 from openquake.engine.utils import tasks
 from openquake.engine.db import models
-from openquake.engine.input import source
-from openquake.engine import writer
-from openquake.engine.utils.general import block_splitter
+from openquake.engine import logs, writer
 from openquake.engine.performance import EnginePerformanceMonitor
+
+from django.db import transaction
 
 AVAILABLE_GSIMS = openquake.hazardlib.gsim.get_available_gsims()
 
 
 @tasks.oqtask
-def gmfs(job_id, sites, rupture, gmf_id, task_seed, realizations, task_no):
+def gmfs(job_id, ses_ruptures, sitecol, imts, gmf_id):
     """
-    A celery task wrapper function around :func:`compute_gmfs`.
-    See :func:`compute_gmfs` for parameter definitions.
+    :param int job_id: the current job ID
+    :param ses_ruptures: a set of `SESRupture` instances
+    :param sitecol: a `SiteCollection` instance
+    :param imts: a list of hazardlib IMT instances
+    :param int gmf_id: the ID of a `Gmf` instance
     """
-    numpy.random.seed(task_seed)
-    gmf_dict = compute_gmfs(job_id, sites, rupture, gmf_id, realizations)
-    with EnginePerformanceMonitor('saving gmfs', job_id, gmfs):
-        save_gmf(gmf_id, gmf_dict, sites, task_no)
-
-
-def compute_gmfs(job_id, sites, rupture, gmf_id, realizations):
-    """
-    Compute ground motion fields and store them in the db.
-
-    :param job_id:
-        ID of the currently running job.
-    :param sites:
-        The subset of the full SiteCollection scanned by this task
-    :param rupture:
-        The hazardlib rupture from which we will generate
-        ground motion fields.
-    :param gmf_id:
-        the id of a :class:`openquake.engine.db.models.Gmf` record
-    :param realizations:
-        Number of realizations to create.
-    """
-    hc = models.HazardCalculation.objects.get(oqjob=job_id)
-    imts = [from_string(x) for x in hc.intensity_measure_types]
+    hc = models.oqparam(job_id)
     gsim = AVAILABLE_GSIMS[hc.gsim]()  # instantiate the GSIM class
-    correlation_model = haz_general.get_correl_model(hc)
+    correlation_model = models.get_correl_model(
+        models.OqJob.objects.get(pk=job_id))
 
+    cache = collections.defaultdict(list)  # {site_id, imt -> gmvs}
+    inserter = writer.CacheInserter(models.GmfData, 1000)
+    # insert GmfData in blocks of 1000 sites
+
+    # NB: ses_ruptures a non-empty list produced by the block_splitter
+    rupture = ses_ruptures[0].rupture  # ProbabilisticRupture instance
     with EnginePerformanceMonitor('computing gmfs', job_id, gmfs):
-        return ground_motion_fields(
-            rupture, sites, imts, gsim,
-            hc.truncation_level, realizations=realizations,
-            correlation_model=correlation_model)
+        gmf = GmfComputer(rupture, sitecol, imts, [gsim],
+                          getattr(hc, 'truncation_level', None),
+                          correlation_model)
+        gname = gsim.__class__.__name__
+        for ses_rup in ses_ruptures:
+            for (gname, imt), gmvs in gmf.compute(ses_rup.seed):
+                for site_id, gmv in zip(sitecol.sids, gmvs):
+                    cache[site_id, imt].append((gmv, ses_rup.id))
+
+    with EnginePerformanceMonitor('saving gmfs', job_id, gmfs):
+        for (site_id, imt_str), data in cache.iteritems():
+            imt = from_string(imt_str)
+            gmvs, rup_ids = zip(*data)
+            inserter.add(
+                models.GmfData(
+                    gmf_id=gmf_id,
+                    task_no=0,
+                    imt=imt[0],
+                    sa_period=imt[1],
+                    sa_damping=imt[2],
+                    site_id=site_id,
+                    rupture_ids=rup_ids,
+                    gmvs=gmvs))
+        inserter.flush()
 
 
-@transaction.commit_on_success(using='job_init')
-def save_gmf(gmf_id, gmf_dict, sites, task_no):
+def create_db_ruptures(rupture, ses_coll, tags, seed):
     """
-    Helper method to save computed GMF data to the database.
+    Insert the SESRuptures associated to the given rupture and
+    SESCollection.
 
-    :param int gmf_id:
-        the id of a :class:`openquake.engine.db.models.Gmf` record
-    :param dict gmf_dict:
-        The GMF results during the calculation
-    :param sites:
-        An :class:`openquake.hazardlib.site.SiteCollection` object
+    :param rupture: hazardlib rupture
+    :param ses_coll: SESCollection instance
+    :param tags: tags of the ruptures to insert
+    :seed: a random seed
+    :returns: the IDs of the inserted ProbabilisticRupture and SESRuptures
     """
-    inserter = writer.CacheInserter(models.GmfData, 100)
-    # NB: GmfData may contain large arrays and the cache may become large
-
-    for imt, gmfs_ in gmf_dict.iteritems():
-        # ``gmfs`` comes in as a numpy.matrix
-        # we want it is an array; it handles subscripting
-        # in the way that we want
-        gmfarray = numpy.array(gmfs_)
-        imt_name, sa_period, sa_damping = imt
-        for i, site in enumerate(sites):
-            inserter.add(models.GmfData(
-                gmf_id=gmf_id,
-                task_no=task_no,
-                imt=imt_name,
-                sa_period=sa_period,
-                sa_damping=sa_damping,
-                site_id=site.id,
-                rupture_ids=None,
-                gmvs=gmfarray[i].tolist()))
-
-    inserter.flush()
+    prob_rup = models.ProbabilisticRupture.create(rupture, ses_coll)
+    inserter = writer.CacheInserter(models.SESRupture, max_cache_size=100000)
+    rnd = random.Random()
+    rnd.seed(seed)
+    sesrupts = [
+        models.SESRupture(
+            ses_id=1, rupture=prob_rup, tag=tag,
+            seed=rnd.randint(0, models.MAX_SINT_32))
+        for tag in tags]
+    return prob_rup.id, inserter.saveall(sesrupts)
 
 
 class ScenarioHazardCalculator(haz_general.BaseHazardCalculator):
@@ -128,13 +124,9 @@ class ScenarioHazardCalculator(haz_general.BaseHazardCalculator):
         self.gmf = None
         self.rupture = None
 
-    def initialize_sources(self):
-        """
-        Get the rupture_model file from the job.ini file, and set the
-        attribute self.rupture.
-        """
-        nrml = RuptureModelParser(self.hc.inputs['rupture_model']).parse()
-        self.rupture = source.NrmlHazardlibConverter(self.hc)(nrml)
+    def initialize_realizations(self):
+        """There are no realizations for the scenario calculator"""
+        pass
 
     def pre_execute(self):
         """
@@ -145,40 +137,79 @@ class ScenarioHazardCalculator(haz_general.BaseHazardCalculator):
         latter piece basically defines the work to be done in the
         `execute` phase.)
         """
-        self.parse_risk_models()
-        self.initialize_sources()
-        self.initialize_site_model()
+        # if you don't use an explicit transaction, errors will be masked
+        # the problem is that Django by default performs implicit transactions
+        # without rollback, see
+        # https://docs.djangoproject.com/en/1.3/topics/db/transactions/
+        with transaction.commit_on_success(using='job_init'):
+            self.parse_risk_models()
+        with transaction.commit_on_success(using='job_init'):
+            self.initialize_site_collection()
 
-        # create a record in the output table
+        self.create_ruptures()
+        hc = self.job.get_oqparam()
+
+        self.imts = imts = map(
+            from_string, sorted(hc.intensity_measure_types_and_levels))
+        n_sites = len(self.site_collection)
+        n_gmf = hc.number_of_ground_motion_fields
+        output_weight = n_sites * len(imts) * n_gmf
+        logs.LOG.info('Expected output size=%s', output_weight)
+        models.JobInfo.objects.create(
+            oq_job=self.job,
+            num_sites=n_sites,
+            num_realizations=1,
+            num_imts=len(imts),
+            num_levels=0,
+            input_weight=0,
+            output_weight=output_weight)
+        self.check_limits(input_weight=0, output_weight=output_weight)
+        return 0, output_weight
+
+    def create_ruptures(self):
+        self.rupture = get_rupture(models.oqparam(self.job.id))
+
+        # check filtering
+        hc = self.hc
+        self.sites = filters.filter_sites_by_distance_to_rupture(
+            self.rupture, hc.maximum_distance, self.site_collection)
+        if self.sites is None:
+            raise RuntimeError(
+                'All sites where filtered out! '
+                'maximum_distance=%s km' % hc.maximum_distance)
+
+        # create ses output
+        output = models.Output.objects.create(
+            oq_job=self.job,
+            display_name='SES Collection',
+            output_type='ses')
+        self.ses_coll = models.SESCollection.create(output=output)
+
+        # create gmf output
         output = models.Output.objects.create(
             oq_job=self.job,
             display_name="GMF",
             output_type="gmf_scenario")
-
-        # create an associated gmf record
         self.gmf = models.Gmf.objects.create(output=output)
 
-    def _get_realizations(self):
-        return range(self.hc.number_of_ground_motion_fields)
+        with self.monitor('saving ruptures'):
+            tags = ['scenario-%010d' % i for i in xrange(
+                    self.hc.number_of_ground_motion_fields)]
+            create_db_ruptures(self.rupture, self.ses_coll, tags,
+                               self.hc.random_seed)
 
     def task_arg_gen(self):
         """
-        Loop through realizations and sources to generate a sequence of
-        task arg tuples. Each tuple of args applies to a single task.
-
-        Yielded results are 6-uples of the form (job_id,
-        sites, rupture_id, gmf_id, task_seed, realizations, task_no)
-        (task_seed will be used to seed numpy for temporal occurence sampling).
+        Yield a tuple of the form (job_id, sitecol, rupture_id, gmf_id,
+        task_seed, num_realizations). `task_seed` will be used to seed
+        numpy for temporal occurence sampling. Only a single task
+        will be generated which is fine since the computation is fast
+        anyway.
         """
-        rnd = random.Random()
-        rnd.seed(self.hc.random_seed)
-        # TODO: fix the block size dependency
-        # (https://bugs.launchpad.net/oq-engine/+bug/1225287)
-        # then self.block_split can be used, consistently with the
-        # other calculators
-        blocks = block_splitter(self.hc.site_collection, 1000)
-        for task_no, sites in enumerate(blocks):
-            task_seed = rnd.randint(0, models.MAX_SINT_32)
-            yield (self.job.id, SiteCollection(sites),
-                   self.rupture, self.gmf.id, task_seed,
-                   self.hc.number_of_ground_motion_fields, task_no)
+        ses_ruptures = models.SESRupture.objects.filter(
+            rupture__ses_collection=self.ses_coll.id)
+        for ruptures in split_in_blocks(ses_ruptures, self.concurrent_tasks):
+            yield self.job.id, ruptures, self.sites, self.imts, self.gmf.id
+
+    def task_completed(self, result):
+        """Do nothing"""

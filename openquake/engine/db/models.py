@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -25,29 +25,32 @@
 Model representations of the OpenQuake DB tables.
 '''
 
+import os
 import collections
 import operator
+import itertools
 from datetime import datetime
 
 
 import numpy
 from scipy import interpolate
 
-from django.db import transaction, connections
+from django.db import connections
 from django.core.exceptions import ObjectDoesNotExist
 
 from django.contrib.gis.db import models as djm
-from shapely import wkt
 
 from openquake.hazardlib.imt import from_string
-from openquake.hazardlib import source, geo
-from openquake.hazardlib.site import Site, SiteCollection
+from openquake.hazardlib import geo, calc, correlation
+from openquake.hazardlib.site import FilteredSiteCollection
+
+from openquake.commonlib.riskmodels import loss_type_to_cost_type
+from openquake.commonlib.readinput import get_mesh
+from openquake.commonlib.oqvalidation import OqParam
+from openquake.commonlib import logictree
 
 from openquake.engine.db import fields
 from openquake.engine import writer
-
-# source prefiltering is enabled for #sites <= FILTERING_THRESHOLD
-FILTERING_THRESHOLD = 10000
 
 #: Kind of supported curve statistics
 STAT_CHOICES = (
@@ -87,7 +90,6 @@ MAX_SINT_32 = (2 ** 31) - 1
 #: Kind of supported type of loss outputs
 LOSS_TYPES = ["structural", "nonstructural", "fatalities", "contents"]
 
-
 #: relative tolerance to consider two risk outputs (almost) equal
 RISK_RTOL = 0.05
 
@@ -116,39 +118,26 @@ INPUT_TYPE_CHOICES = (
     (u'structural_vulnerability_retrofitted',
      u'Structural Vulnerability Retrofitted'))
 
-VULNERABILITY_TYPE_CHOICES = [choice[0]
-                              for choice in INPUT_TYPE_CHOICES
-                              if choice[0].endswith('vulnerability')]
+
+RAISE_EXC = object()  # sentinel used in OqJob.get_param
 
 
-#: Hold both a Vulnerability function or a fragility function set and
-#: the IMT associated to it
-RiskModel = collections.namedtuple(
-    'RiskModel',
-    'imt vulnerability_function fragility_functions')
+class MissingParameter(KeyError):
+    """Raised by OqJob.get_param when a parameter is missing in the database"""
 
 
-def required_imts(risk_models):
-    """
-    Get all the intensity measure types required by `risk_models`
+############## Fix FloatField underflow error ##################
+# http://stackoverflow.com/questions/9556586/floating-point-numbers-of-python-float-and-postgresql-double-precision
 
-    A nested dict taxonomy -> loss_type -> `RiskModel` instance
+def _get_prep_value(self, value):
+    if value is None:
+        return None
+    val = float(value)
+    if abs(val) < 1E-300:
+        return 0.
+    return val
 
-    :returns: a set with all the required imts
-    """
-    risk_models = sum([d.values() for d in risk_models.values()], [])
-    return set([m.imt for m in risk_models])
-
-
-def loss_types(risk_models):
-    return set(sum([d.keys() for d in risk_models.values()], []))
-
-
-def cost_type(loss_type):
-    if loss_type == "fatalities":
-        return "occupants"
-    else:
-        return loss_type
+djm.FloatField.get_prep_value = _get_prep_value
 
 
 def risk_almost_equal(o1, o2, key=lambda x: x, rtol=RISK_RTOL, atol=RISK_ATOL):
@@ -210,36 +199,31 @@ def queryset_iter(queryset, chunk_size):
             offset += chunk_size
 
 
-## Tables in the 'admin' schema.
-
-
-class RevisionInfo(djm.Model):
-    '''
-    Revision information
-    '''
-    artefact = djm.TextField(unique=True)
-    revision = djm.TextField()
-    step = djm.IntegerField(default=0)
-    last_update = djm.DateTimeField(editable=False, default=datetime.utcnow)
-
-    class Meta:
-        db_table = 'admin\".\"revision_info'
+def build_curves(rlz, curves_by_trt_model_gsim):
+    """
+    Build on the fly the hazard curves for the current realization
+    by looking at the associations stored in the database table
+    `hzrdr.assoc_lt_rlz_trt_model`.
+    """
+    # fixed a realization, there are T associations where T is the
+    # number of TrtModels
+    curves = 0
+    for art in AssocLtRlzTrtModel.objects.filter(rlz=rlz):
+        pnes = 1. - curves_by_trt_model_gsim[art.trt_model_id, art.gsim]
+        curves = 1. - (1. - curves) * pnes
+    return curves
 
 
 ## Tables in the 'hzrdi' (Hazard Input) schema.
 
 class SiteModel(djm.Model):
     '''
-     A model for site-specific parameters.
-
-    Used in Hazard calculations.
+    A model for site-specific parameters, used in hazard calculations.
     '''
-
     job = djm.ForeignKey('OqJob')
     # Average shear wave velocity for top 30 m. Units m/s.
     vs30 = djm.FloatField()
-    # 'measured' or 'inferred'. Identifies if vs30 value has been measured or
-    # inferred.
+    # 'measured' or 'inferred'
     vs30_type = djm.TextField(choices=VS30_TYPE_CHOICES)
     # Depth to shear wave velocity of 1.0 km/s. Units m.
     z1pt0 = djm.FloatField()
@@ -265,7 +249,6 @@ class OqJob(djm.Model):
     An OpenQuake engine run started by the user
     '''
     user_name = djm.TextField()
-    hazard_calculation = djm.OneToOneField('HazardCalculation', null=True)
     risk_calculation = djm.OneToOneField('RiskCalculation', null=True)
     LOG_LEVEL_CHOICES = (
         (u'debug', u'Debug'),
@@ -288,7 +271,7 @@ class OqJob(djm.Model):
     status = djm.TextField(choices=STATUS_CHOICES, default='pre_executing')
     oq_version = djm.TextField(null=True, blank=True)
     hazardlib_version = djm.TextField(null=True, blank=True)
-    nrml_version = djm.TextField(null=True, blank=True)
+    commonlib_version = djm.TextField(null=True, blank=True)
     risklib_version = djm.TextField(null=True, blank=True)
     is_running = djm.BooleanField(default=False)
     duration = djm.IntegerField(default=0)
@@ -300,15 +283,145 @@ class OqJob(djm.Model):
         db_table = 'uiapi\".\"oq_job'
 
     @property
-    def calculation(self):
+    def job_type(self):
         """
-        :returns: a calculation object (hazard or risk) depending on
-        the type of calculation. Useful in situations (e.g. core
-        engine, stats, kvs, progress) where you do not have enough
-        context about which kind of calculation is but still you want
-        to access the common feature of a Calculation object.
+        'hazard' or 'risk'
         """
-        return self.hazard_calculation or self.risk_calculation
+        return 'hazard' if self.risk_calculation is None else 'risk'
+
+    # TODO: this property will disappear when RiskCalculation will disappear
+    @property
+    def calc_id(self):
+        """Return the calculation id"""
+        if self.risk_calculation:
+            return self.risk_calculation.id
+        else:
+            return self.id
+
+    def get_param(self, name, missing=RAISE_EXC):
+        """
+        `job.get_param(name)` returns the value of the requested parameter
+        or raise a MissingParameter exception if the parameter does not
+        exist in the database.
+
+        `job.get_param(name, missing)` returns the value of the requested
+        parameter or the `missing` value if the parameter does not
+        exist in the database.
+
+        :param name: the name of the parameter
+        :param missing: value returned if the parameter is missing
+
+        NB: since job_param.value is NOT NULL, `.get_param(name)`
+        can return None only if the parameter is missing.
+        """
+        try:
+            return JobParam.objects.get(job=self, name=name).value
+        except ObjectDoesNotExist:
+            if missing is RAISE_EXC:
+                raise MissingParameter(name)
+            return missing
+
+    def get_oqparam(self):
+        """
+        Return an OqParam object as read from the database
+        """
+        oqparam = object.__new__(OqParam)
+        for row in JobParam.objects.filter(job=self):
+            setattr(oqparam, row.name, row.value)
+        return oqparam
+
+    def save_params(self, params):
+        """
+        Save on the database table job_params the given parameters.
+
+        :param job: an :class:`OqJob` instance
+        :param params: a dictionary {name: string} of parameters
+        """
+        for name, value in params.iteritems():
+            JobParam.objects.create(job=self, name=name, value=repr(value))
+
+    def save_hazard_sites(self):
+        """
+        Populate the table HazardSite by inferring the points from
+        the sites, region, or exposure.
+        """
+        assert self.job_type == 'hazard', self.job_type
+        oqparam = self.get_oqparam()
+        if 'exposure' in oqparam.inputs:
+            assets = self.exposuremodel.exposuredata_set.all()
+            # the coords here must be sorted; the issue is that the
+            # disaggregation calculator has a for loop of kind
+            # for site in sites:
+            #     bin_edge, disagg_matrix = disaggregation(site, ...)
+            # the generated ruptures are random if the order of the sites
+            # is random, even if the seed is fixed; in particular for some
+            # ordering no ruptures are generated and the test
+            # qa_tests/hazard/disagg/case_1/test.py fails with a bad
+            # error message
+            coords = sorted(
+                set((asset.site.x, asset.site.y) for asset in assets))
+            lons, lats = zip(*coords)
+            mesh = geo.Mesh(numpy.array(lons), numpy.array(lats), None)
+        else:
+            mesh = get_mesh(oqparam)
+        sids = save_sites(self, ((p.longitude, p.latitude) for p in mesh))
+        return mesh, sids
+
+    def __repr__(self):
+        return '<%s %d, %s>' % (self.__class__.__name__,
+                                self.id, self.job_type)
+
+
+def oqparam(job_id):
+    """
+    :param job_id: ID of :class:`openquake.engine.db.models.OqJob`
+    :returns: instance of :class:`openquake.commonlib.oqvalidation.OqParam`
+    """
+    return OqJob.objects.get(pk=job_id).get_oqparam()
+
+
+class JobStats(djm.Model):
+    '''
+    Capture various statistics about a job.
+    '''
+    oq_job = djm.OneToOneField('OqJob')
+    start_time = djm.DateTimeField(editable=False, default=datetime.utcnow)
+    stop_time = djm.DateTimeField(editable=False)
+    # The disk space occupation in bytes
+    disk_space = djm.IntegerField(null=True)
+
+    class Meta:
+        db_table = 'uiapi\".\"job_stats'
+
+
+# created at the end of the pre_execute phase
+class JobInfo(djm.Model):
+    '''
+    Store information about a job.
+    '''
+    oq_job = djm.OneToOneField('OqJob')
+    parent_job = djm.ForeignKey('OqJob')
+    num_sites = djm.IntegerField(null=False)
+    num_realizations = djm.IntegerField(null=False)
+    num_imts = djm.IntegerField(null=False)
+    num_levels = djm.FloatField(null=False)
+    input_weight = djm.FloatField(null=False)
+    output_weight = djm.FloatField(null=False)
+
+    class Meta:
+        db_table = 'uiapi\".\"job_info'
+
+
+class JobParam(djm.Model):
+    '''
+    The parameters of a job
+    '''
+    job = djm.ForeignKey('OqJob')
+    name = djm.TextField(null=False)
+    value = fields.LiteralField(null=False)
+
+    class Meta:
+        db_table = 'uiapi\".\"job_param'
 
 
 class Performance(djm.Model):
@@ -329,534 +442,16 @@ class Performance(djm.Model):
         db_table = 'uiapi\".\"performance'
 
 
-class JobStats(djm.Model):
-    '''
-    Capture various statistics about a job.
-    '''
-    oq_job = djm.ForeignKey('OqJob')
-    start_time = djm.DateTimeField(editable=False, default=datetime.utcnow)
-    stop_time = djm.DateTimeField(editable=False)
-    # The number of total sites in job
-    num_sites = djm.IntegerField(null=True)
-    # The disk space occupation in bytes
-    disk_space = djm.IntegerField(null=True)
-    num_sources = fields.IntArrayField(null=True)
-
-    class Meta:
-        db_table = 'uiapi\".\"job_stats'
-
-
-class CNodeStats(djm.Model):
-    '''
-    Captures the compute node status (changes).
-    '''
-    oq_job = djm.ForeignKey('OqJob')
-    node = djm.TextField(help_text="Compute node name")
-    STATUS_CHOICES = (
-        (u"up", u"Compute node available"),
-        (u"down", u"Compute node unavailable"),
-    )
-    current_status = djm.TextField(
-        choices=STATUS_CHOICES, help_text="Current compute node status")
-
-    # Please note: the time stamps are managed by triggers, no need to set
-    # them manually
-    current_ts = djm.DateTimeField(editable=False, default=datetime.utcnow)
-    previous_ts = djm.DateTimeField(null=True)
-
-    failures = djm.IntegerField(
-        help_text="Number of up -> down status changes", default=0)
-
-    class Meta:
-        db_table = 'uiapi\".\"cnode_stats'
-
-
-class HazardCalculation(djm.Model):
-    '''
-    Parameters needed to run a Hazard job.
-    '''
-    _site_collection = ()  # see the corresponding instance variable
-
-    @classmethod
-    def create(cls, **kw):
-        _prep_geometry(kw)
-        return cls(**kw)
-
-    # Contains the absolute path to the directory containing the job config
-    # file.
-    base_path = djm.TextField()
-    export_dir = djm.TextField(null=True, blank=True)
-
-    #####################
-    # General parameters:
-    #####################
-
-    # A description for this config profile which is meaningful to a user.
-    description = djm.TextField(default='', blank=True)
-
-    CALC_MODE_CHOICES = (
-        (u'classical', u'Classical PSHA'),
-        (u'event_based', u'Probabilistic Event-Based'),
-        (u'disaggregation', u'Disaggregation'),
-        (u'scenario', u'Scenario'),
-    )
-    calculation_mode = djm.TextField(choices=CALC_MODE_CHOICES)
-    inputs = fields.PickleField(blank=True)
-
-    # For the calculation geometry, choose either `region` (with
-    # `region_grid_spacing`) or `sites`.
-    region = djm.PolygonField(srid=DEFAULT_SRID, null=True, blank=True)
-    # Discretization parameter for a `region`. Units in degrees.
-    region_grid_spacing = djm.FloatField(null=True, blank=True)
-    # The points of interest for a calculation.
-    sites = djm.MultiPointField(srid=DEFAULT_SRID, null=True, blank=True)
-
-    ########################
-    # Logic Tree parameters:
-    ########################
-    random_seed = djm.IntegerField(null=True, blank=True)
-    number_of_logic_tree_samples = djm.IntegerField(null=True, blank=True)
-
-    ###############################################
-    # ERF (Earthquake Rupture Forecast) parameters:
-    ###############################################
-    rupture_mesh_spacing = djm.FloatField(
-        help_text=('Rupture mesh spacing (in kilometers) for simple/complex '
-                   'fault sources rupture discretization'),
-        null=True,
-        blank=True,
-
-    )
-    width_of_mfd_bin = djm.FloatField(
-        help_text=('Truncated Gutenberg-Richter MFD (Magnitude Frequency'
-                   'Distribution) bin width'),
-        null=True,
-        blank=True,
-    )
-    area_source_discretization = djm.FloatField(
-        help_text='Area Source Disretization, in kilometers',
-        null=True,
-        blank=True,
-    )
-
-    ##################
-    # Site parameters:
-    ##################
-    # If there is no `site_model`, these 4 parameters must be specified:
-    reference_vs30_value = djm.FloatField(
-        help_text='Shear wave velocity in the uppermost 30 m. In m/s.',
-        null=True,
-        blank=True,
-    )
-    VS30_TYPE_CHOICES = (
-        (u'measured', u'Measured'),
-        (u'inferred', u'Inferred'),
-    )
-    reference_vs30_type = djm.TextField(
-        choices=VS30_TYPE_CHOICES,
-        null=True,
-        blank=True,
-    )
-    reference_depth_to_2pt5km_per_sec = djm.FloatField(
-        help_text='Depth to where shear-wave velocity = 2.5 km/sec. In km.',
-        null=True,
-        blank=True,
-    )
-    reference_depth_to_1pt0km_per_sec = djm.FloatField(
-        help_text='Depth to where shear-wave velocity = 1.0 km/sec. In m.',
-        null=True,
-        blank=True,
-    )
-
-    #########################
-    # Calculation parameters:
-    #########################
-    investigation_time = djm.FloatField(
-        help_text=('Time span (in years) for probability of exceedance '
-                   'calculation'),
-        null=True,
-        blank=True,
-    )
-    intensity_measure_types_and_levels = fields.DictField(
-        help_text=(
-            'Dictionary containing for each intensity measure type ("PGA", '
-            '"PGV", "PGD", "SA", "IA", "RSD", "MMI"), the list of intensity '
-            'measure levels for calculating probability of exceedence'),
-        null=True,
-        blank=True,
-    )
-    truncation_level = fields.NullFloatField(
-        help_text='Level for ground motion distribution truncation',
-        null=True,
-        blank=True,
-    )
-    maximum_distance = djm.FloatField(
-        help_text=('Maximum distance (in km) of sources to be considered in '
-                   'the probability of exceedance calculation. Sources more '
-                   'than this distance away (from the sites of interest) are '
-                   'ignored.'),
-    )
-
-    ################################
-    # Event-Based Calculator params:
-    ################################
-    intensity_measure_types = fields.CharArrayField(
-        help_text=(
-            'List of intensity measure types (input for GMF calculation)'),
-        null=True,
-        blank=True,
-    )
-    ses_per_logic_tree_path = djm.IntegerField(
-        help_text=('Number of Stochastic Event Sets to compute per logic tree'
-                   ' branch (enumerated or randomly sampled'),
-        null=True,
-        blank=True,
-    )
-    GROUND_MOTION_CORRELATION_MODELS = (
-        (u'JB2009', u'Jayaram-Baker 2009'),
-    )
-    ground_motion_correlation_model = djm.TextField(
-        help_text=('Name of the ground correlation model to use in the'
-                   ' calculation'),
-        null=True,
-        blank=True,
-        choices=GROUND_MOTION_CORRELATION_MODELS,
-    )
-    ground_motion_correlation_params = fields.DictField(
-        help_text=('Parameters specific to the chosen ground motion'
-                   ' correlation model'),
-        null=True,
-        blank=True,
-    )
-
-    ###################################
-    # Disaggregation Calculator params:
-    ###################################
-    mag_bin_width = djm.FloatField(
-        help_text=('Width of magnitude bins, which ultimately defines the size'
-                   ' of the magnitude dimension of a disaggregation matrix'),
-        null=True,
-        blank=True,
-    )
-    distance_bin_width = djm.FloatField(
-        help_text=('Width of distance bins, which ultimately defines the size'
-                   ' of the distance dimension of a disaggregation matrix'),
-        null=True,
-        blank=True,
-    )
-    coordinate_bin_width = djm.FloatField(
-        help_text=('Width of coordinate bins, which ultimately defines the'
-                   ' size of the longitude and latitude dimensions of a'
-                   ' disaggregation matrix'),
-        null=True,
-        blank=True,
-    )
-    num_epsilon_bins = djm.IntegerField(
-        help_text=('Number of epsilon bins, which defines the size of the'
-                   ' epsilon dimension of a disaggregation matrix'),
-        null=True,
-        blank=True,
-    )
-    ################################
-    # Scenario Calculator params:
-    ################################
-    gsim = djm.TextField(
-        help_text=('Name of the ground shaking intensity model to use in the '
-                   'calculation'),
-        null=True,
-        blank=True,
-    )
-    number_of_ground_motion_fields = djm.IntegerField(
-        null=True,
-        blank=True,
-    )
-    poes_disagg = fields.FloatArrayField(
-        help_text=('The probabilities of exceedance for which we interpolate'
-                   ' grond motion values from hazard curves. This GMV is used'
-                   ' as input for computing disaggregation histograms'),
-        null=True,
-        blank=True,
-    )
-
-    ################################
-    # Output/post-processing params:
-    ################################
-    # Classical params:
-    ###################
-    mean_hazard_curves = fields.OqNullBooleanField(
-        help_text='Compute mean hazard curves',
-        null=True,
-        blank=True,
-    )
-    quantile_hazard_curves = fields.FloatArrayField(
-        help_text='Compute quantile hazard curves',
-        null=True,
-        blank=True,
-    )
-    poes = fields.FloatArrayField(
-        help_text=('PoEs (probabilities of exceedence) to be used for '
-                   'computing hazard maps and uniform hazard spectra'),
-        null=True,
-        blank=True,
-    )
-    hazard_maps = fields.OqNullBooleanField(
-        help_text='Compute hazard maps',
-        null=True,
-        blank=True,
-    )
-    uniform_hazard_spectra = fields.OqNullBooleanField(
-        help_text=('Compute uniform hazard spectra; if true, hazard maps will'
-                   ' be computed as well'),
-        null=True,
-        blank=True,
-    )
-    export_multi_curves = fields.OqNullBooleanField(
-        help_text=('If true hazard curve outputs that groups multiple curves '
-                   'in multiple imt will be exported when asked in export '
-                   'phase.'))
-    # Event-Based params:
-    #####################
-    ground_motion_fields = fields.OqNullBooleanField(
-        help_text=('If true, ground motion fields will be computed (in '
-                   'addition to stochastic event sets)'),
-        null=True,
-        blank=True,
-    )
-    hazard_curves_from_gmfs = fields.OqNullBooleanField(
-        help_text=('If true, ground motion fields will be post-processed into '
-                   'hazard curves.'),
-        null=True,
-        blank=True,
-    )
-
-    class Meta:
-        db_table = 'uiapi\".\"hazard_calculation'
-
-    # class attributes used as defaults; I am avoiding `__init__`
-    # to avoid issues with Django caching mechanism (MS)
-    _points_to_compute = None
-
-    @property
-    def prefiltered(self):
-        """
-        Prefiltering is enabled when there are few sites (up to %d)
-        """ % FILTERING_THRESHOLD
-        return self.maximum_distance and \
-            len(self.site_collection) <= FILTERING_THRESHOLD
-
-    @property
-    def vulnerability_models(self):
-        return [self.inputs[vf_type]
-                for vf_type in VULNERABILITY_TYPE_CHOICES
-                if vf_type in self.inputs]
-
-    @property
-    def site_model(self):
-        """
-        Get the site model filename for this calculation
-        """
-        return self.inputs.get('site_model')
-
-    ## TODO: this could be implemented with a view, now that there is
-    ## a site table
-    def get_closest_site_model_data(self, point):
-        """Get the closest available site model data from the database
-        for a given site model and :class:`openquake.hazardlib.geo.point.Point`
-
-        :param site:
-            :class:`openquake.hazardlib.geo.point.Point` instance.
-
-        :returns:
-            The closest :class:`openquake.engine.db.models.SiteModel`
-            for the given ``point`` of interest.
-
-            This function uses the PostGIS `ST_Distance_Sphere
-            <http://postgis.refractions.net/docs/ST_Distance_Sphere.html>`_
-            function to calculate distance.
-
-            If there is no site model data, return `None`.
-        """
-        query = """
-        SELECT
-            hzrdi.site_model.*,
-            min(ST_Distance_Sphere(location, %s))
-                AS min_distance
-        FROM hzrdi.site_model
-        WHERE job_id = %s
-        GROUP BY id
-        ORDER BY min_distance
-        LIMIT 1;"""
-
-        raw_query_set = SiteModel.objects.raw(
-            query, ['SRID=4326; %s' % point.wkt2d, self.oqjob.id]
-        )
-
-        site_model_data = list(raw_query_set)
-
-        assert len(site_model_data) <= 1, (
-            "This query should return at most 1 record.")
-
-        if len(site_model_data) == 1:
-            return site_model_data[0]
-
-    def points_to_compute(self, save_sites=True):
-        """
-        Generate a :class:`~openquake.hazardlib.geo.mesh.Mesh` of points.
-        These points indicate the locations of interest in a hazard
-        calculation.
-
-        The mesh can be calculated given a `region` polygon and
-        `region_grid_spacing` (the discretization parameter), or from a list of
-        `sites`.
-
-        .. note::
-            This mesh is cached for efficiency when dealing with large numbers
-            of calculation points. If you need to clear the cache and
-            recompute, set `_points_to_compute` to `None` and call this method
-            again.
-        """
-        if self._points_to_compute is None:
-            if self.pk and 'exposure' in self.inputs:
-                assets = self.oqjob.exposuremodel.exposuredata_set.all(
-                    ).order_by('asset_ref')
-
-                # the points here must be sorted
-                lons, lats = zip(*sorted(set((asset.site.x, asset.site.y)
-                                             for asset in assets)))
-                # Cache the mesh:
-                self._points_to_compute = geo.Mesh(
-                    numpy.array(lons), numpy.array(lats), depths=None
-                )
-            elif self.region and self.region_grid_spacing:
-                # assume that the polygon is a single linear ring
-                coords = self.region.coords[0]
-                points = [geo.Point(*x) for x in coords]
-                poly = geo.Polygon(points)
-                # Cache the mesh:
-                self._points_to_compute = poly.discretize(
-                    self.region_grid_spacing
-                )
-            elif self.sites is not None:
-                lons, lats = zip(*self.sites.coords)
-                # Cache the mesh:
-                self._points_to_compute = geo.Mesh(
-                    numpy.array(lons), numpy.array(lats), depths=None
-                )
-            # store the sites
-            if save_sites and self._points_to_compute:
-                self.save_sites([(pt.longitude, pt.latitude)
-                                 for pt in self._points_to_compute])
-
-        return self._points_to_compute
-
-    @property
-    def site_collection(self):
-        """
-        Create a SiteCollection from a HazardCalculation object.
-        First, take all of the points/locations of interest defined by the
-        calculation geometry. For each point, do distance queries on the site
-        model and get the site parameters which are closest to the point of
-        interest. This aggregation of points to the closest site parameters
-        is what we store in the `site_collection` field.
-        If the computation does not specify a site model the same 4 reference
-        site parameters are used for all sites. The sites are ordered by id,
-        to ensure reproducibility in tests.
-        """
-        if len(self._site_collection):
-            return self._site_collection
-
-        hsites = HazardSite.objects.filter(
-            hazard_calculation=self).order_by('id')
-        if not hsites:
-            raise RuntimeError('No sites were imported!')
-        # NB: the sites MUST be ordered. The issue is that the disaggregation
-        # calculator has a for loop of kind
-        # for site in sites:
-        #     bin_edge, disagg_matrix = disaggregation(site, ...)
-        # the generated ruptures are random if the order of the sites
-        # is random, even if the seed is fixed; in particular for some
-        # ordering no ruptures are generated and the test
-        # qa_tests/hazard/disagg/case_1/test.py fails with a bad
-        # error message
-        sites = []
-        site_model_inp = self.site_model
-        for hsite in hsites:
-            pt = geo.point.Point(hsite.location.x, hsite.location.y)
-            if site_model_inp:
-                smd = self.get_closest_site_model_data(pt)
-                measured = smd.vs30_type == 'measured'
-                vs30 = smd.vs30
-                z1pt0 = smd.z1pt0
-                z2pt5 = smd.z2pt5
-            else:
-                vs30 = self.reference_vs30_value
-                measured = self.reference_vs30_type == 'measured'
-                z1pt0 = self.reference_depth_to_1pt0km_per_sec
-                z2pt5 = self.reference_depth_to_2pt5km_per_sec
-
-            sites.append(Site(pt, vs30, measured, z1pt0, z2pt5, hsite.id))
-
-        sc = self._site_collection = SiteCollection(sites)
-        return sc
-
-    def get_imts(self):
-        """
-        Returns intensity mesure types or
-        intensity mesure types with levels.
-        """
-
-        return (self.intensity_measure_types or
-                self.intensity_measure_types_and_levels.keys())
-
-    def save_sites(self, coordinates):
-        """
-        Save all the gives sites on the hzrdi.hazard_site table.
-        :param coordinates: a sequence of (lon, lat) pairs
-        :returns: the ids of the inserted HazardSite instances
-        """
-        sites = [HazardSite(hazard_calculation=self,
-                            location='POINT(%s %s)' % coord)
-                 for coord in coordinates]
-        return writer.CacheInserter.saveall(sites)
-
-    def total_investigation_time(self):
-        """
-        Helper method to compute the total investigation time for a
-        complete set of stochastic event sets for all realizations.
-        """
-        if self.number_of_logic_tree_samples > 0:
-            # The calculation is set to do Monte-Carlo sampling of logic trees
-            # The number of logic tree realizations is specified explicitly in
-            # job configuration.
-            n_lt_realizations = self.number_of_logic_tree_samples
-        else:
-            # The calculation is set do end-branch enumeration of all logic
-            # tree paths
-            # We can get the number of logic tree realizations by counting
-            # initialized lt_realization records.
-            n_lt_realizations = LtRealization.objects.filter(
-                hazard_calculation=self).count()
-
-        investigation_time = (self.investigation_time
-                              * self.ses_per_logic_tree_path
-                              * n_lt_realizations)
-
-        return investigation_time
-
-    def sites_affected_by(self, src):
-        """
-        If the maximum_distance is set and the prefiltering is on,
-        i.e. if the computation involves only few (<=%d) sites,
-        return the filtered subset of the site collection, otherwise
-        return the whole connection. NB: this method returns `None`
-        if the filtering does not find any site close to the source.
-
-        :param src: the source object used for the filtering
-        """ % FILTERING_THRESHOLD
-        if self.prefiltered:
-            return src.filter_sites_by_distance_to_source(
-                self.maximum_distance, self.site_collection)
-        return self.site_collection
+def save_sites(job, coords):
+    """
+    Save all the gives sites on the hzrdi.hazard_site table.
+    :param coordinates: a sequence of (lon, lat) pairs
+    :returns: the ids of the inserted HazardSite instances
+    """
+    sites = [HazardSite(hazard_calculation=job,
+                        location='POINT(%s %s)' % (lon, lat))
+             for lon, lat in coords]
+    return writer.CacheInserter.saveall(sites)
 
 
 class RiskCalculation(djm.Model):
@@ -865,8 +460,7 @@ class RiskCalculation(djm.Model):
     '''
     @classmethod
     def create(cls, **kw):
-        _prep_geometry(kw)
-        return cls(**kw)
+        return cls(**_prep_geometry(kw))
 
     #: Default maximum asset-hazard distance in km
     DEFAULT_MAXIMUM_DISTANCE = 5
@@ -884,10 +478,11 @@ class RiskCalculation(djm.Model):
     description = djm.TextField(default='', blank=True)
 
     CALC_MODE_CHOICES = (
-        (u'classical', u'Classical PSHA'),
+        (u'classical_risk', u'Classical PSHA'),
         (u'classical_bcr', u'Classical BCR'),
-        (u'event_based', u'Probabilistic Event-Based'),
-        (u'scenario', u'Scenario'),
+        (u'event_based_risk', u'Probabilistic Event-Based'),
+        (u'event_based_fr', u'Event-Based From Ruptures'),
+        (u'scenario_risk', u'Scenario'),
         (u'scenario_damage', u'Scenario Damage'),
         (u'event_based_bcr', u'Probabilistic Event-Based BCR'),
     )
@@ -902,16 +497,15 @@ class RiskCalculation(djm.Model):
     # the maximum distance for an hazard value with the corresponding
     # asset. Expressed in kilometers
     maximum_distance = djm.FloatField(
-        null=True, blank=True, default=DEFAULT_MAXIMUM_DISTANCE)
+        null=False, blank=True, default=DEFAULT_MAXIMUM_DISTANCE)
     # the hazard output (it can point to an HazardCurvem, to a
     # Gmf or to a SES collection) used by the risk calculation
     hazard_output = djm.ForeignKey("Output", null=True, blank=True)
 
-    # the HazardCalculation object used by the risk calculation when
+    # the hazard OqJob object used by the risk calculation when
     # each individual Output (i.e. each hazard logic tree realization)
     # is considered
-    hazard_calculation = djm.ForeignKey("HazardCalculation",
-                                        null=True, blank=True)
+    hazard_calculation = djm.ForeignKey("OqJob", null=True, blank=True)
 
     risk_investigation_time = djm.FloatField(
         help_text=('Override the time span (in years) with which the '
@@ -922,7 +516,7 @@ class RiskCalculation(djm.Model):
 
     # A seed used to generate random values to be applied to
     # vulnerability functions
-    master_seed = djm.IntegerField(null=True, blank=True)
+    master_seed = djm.IntegerField(null=False, default=42)
 
     ####################################################
     # For calculators that output (conditional) loss map
@@ -977,7 +571,7 @@ class RiskCalculation(djm.Model):
         help_text=('Width of distance bins'),
         null=True,
         blank=True,
-    )
+        )
     coordinate_bin_width = djm.FloatField(
         help_text=('Width of coordinate bins'),
         null=True,
@@ -998,45 +592,39 @@ class RiskCalculation(djm.Model):
     class Meta:
         db_table = 'uiapi\".\"risk_calculation'
 
-    def get_hazard_calculation(self):
+    def get_hazard_param(self):
         """
-        Get the hazard calculation associated with the hazard output used as an
-        input to this risk calculation.
+        Get the hazard parameters associated with the hazard job that generated
+        the output used as an input for the current risk calculation.
 
         :returns:
-            :class:`HazardCalculation` instance.
+            :class:`openquake.commonlib.oqvalidation.OqParam` instance.
         """
-        try:
-            hcalc = (self.hazard_calculation or
-                     self.hazard_output.oq_job.hazard_calculation)
-        except ObjectDoesNotExist:
-            raise RuntimeError("The provided hazard does not exist")
-        return hcalc
+        return self.hazard_calculation.get_oqparam()
 
     def hazard_outputs(self):
         """
         Returns the list of hazard outputs to be considered. Apply
         `filters` to the default queryset
         """
-
         if self.hazard_output:
             return [self.hazard_output]
         elif self.hazard_calculation:
-            if self.calculation_mode in ["classical", "classical_bcr"]:
+            if self.calculation_mode in ["classical_risk", "classical_bcr"]:
                 filters = dict(output_type='hazard_curve_multi',
                                hazard_curve__lt_realization__isnull=False)
-            elif self.calculation_mode in ["event_based", "event_based_bcr"]:
-                if self.hazard_calculation.ground_motion_fields:
-                    filters = dict(output_type='gmf',
-                                   gmf__lt_realization__isnull=False)
-                else:
-                    filters = dict(output_type='ses')
-            elif self.calculation_mode in ['scenario', 'scenario_damage']:
+            elif self.calculation_mode in [
+                    "event_based_risk", "event_based_bcr"]:
+                filters = dict(
+                    output_type='gmf', gmf__lt_realization__isnull=False)
+            elif self.calculation_mode == "event_based_fr":
+                filters = dict(output_type='ses')
+            elif self.calculation_mode in ['scenario_risk', 'scenario_damage']:
                 filters = dict(output_type='gmf_scenario')
             else:
                 raise NotImplementedError
 
-            return self.hazard_calculation.oqjob.output_set.filter(
+            return self.hazard_calculation.output_set.filter(
                 **filters).order_by('id')
         else:
             raise RuntimeError("Neither hazard calculation "
@@ -1053,20 +641,13 @@ class RiskCalculation(djm.Model):
             not given, `DEFAULT_MAXIMUM_DISTANCE` is used as default) and the
             step (if exists) used by the hazard calculation.
         """
-        dist = self.maximum_distance
+        dist = self.maximum_distance or self.DEFAULT_MAXIMUM_DISTANCE
 
-        if dist is None:
-            dist = self.DEFAULT_MAXIMUM_DISTANCE
+        grid_spacing = self.hazard_calculation.get_param(
+            'region_grid_spacing', None)
+        if grid_spacing:
+            dist = min(dist, grid_spacing * numpy.sqrt(2) / 2)
 
-        hc = self.get_hazard_calculation()
-        if hc.sites is None and hc.region_grid_spacing is not None:
-            dist = min(dist, hc.region_grid_spacing * numpy.sqrt(2) / 2)
-
-        # if we are computing hazard at exact location we set the
-        # maximum_distance to a very small number in order to help the
-        # query to find the results.
-        if 'exposure' in hc.inputs:
-            dist = 0.001
         return dist
 
     @property
@@ -1075,28 +656,40 @@ class RiskCalculation(djm.Model):
 
     @property
     def exposure_model(self):
-        return self.preloaded_exposure_model or self.oqjob.exposuremodel
+        """
+        Return the right exposure model by following rules in order:
 
-    def vulnerability_inputs(self, retrofitted):
-        for loss_type in LOSS_TYPES:
-            ctype = cost_type(loss_type)
-
-            vulnerability_input = self.vulnerability_input(ctype, retrofitted)
-            if vulnerability_input is not None:
-                yield vulnerability_input, loss_type
-
-    def vulnerability_input(self, ctype, retrofitted=False):
-        if retrofitted:
-            input_type = "%s_vulnerability_retrofitted" % ctype
-        else:
-            input_type = "%s_vulnerability" % ctype
-
-        return self.inputs.get(input_type)
+        1. if the `preloaded_exposure_model_id` is set in job_risk.ini, use it
+        2. if an exposure_file is defined in job_risk.ini, use it
+        3. if an exposure was used in the hazard job, use it
+        4. if no exposure is found, return None
+        """
+        return (self.preloaded_exposure_model or
+                extract_from(
+                    [self.oqjob, self.hazard_calculation], 'exposuremodel'))
 
     @property
     def investigation_time(self):
         return (self.risk_investigation_time or
-                self.get_hazard_calculation().investigation_time)
+                self.get_hazard_param().investigation_time)
+
+
+def extract_from(objlist, attr):
+    """
+    Extract an attribute from a list of Django objects, by scanning
+    them in order until a not None attribute is found. If nothing is
+    found, or if an exception ObjectDoesNotExist is raised, return None.
+
+    :param objlist: the list of Django objects
+    :param str attr: the name of the attribute to look for
+    """
+    for obj in objlist:
+        try:
+            value = getattr(obj, attr, None)
+        except ObjectDoesNotExist:
+            value = None
+        if value is not None:
+            return value
 
 
 def _prep_geometry(kwargs):
@@ -1105,56 +698,84 @@ def _prep_geometry(kwargs):
     so that it can save to the database in a geometry field.
 
     :param dict kwargs:
-        `dict` representing some keyword arguments, which may contain geometry
-        definitions in some sort of string or list form
-
+        keyword arguments, which may contain geometry definitions in
+        a list form
     :returns:
-        The modified ``kwargs``, with WKT to replace the input geometry
-        definitions.
+        a dictionary with the geometries converted into WKT
     """
+    kw = kwargs.copy()
     # If geometries were specified as string lists of coords,
     # convert them to WKT before doing anything else.
     for field, wkt_fmt in (('sites', 'MULTIPOINT(%s)'),
                            ('sites_disagg', 'MULTIPOINT(%s)'),
                            ('region', 'POLYGON((%s))'),
                            ('region_constraint', 'POLYGON((%s))')):
-        if field in kwargs:
-            geom = kwargs[field]
-            if geom is None:
-                continue
-            try:
-                wkt.loads(geom)
-                # if this succeeds, we know the wkt is at least valid
-                # we don't know the geometry type though; we'll leave that
-                # to subsequent validation
-            except wkt.ReadingError:
-                try:
-                    coords = [
-                        float(x) for x in fields.ARRAY_RE.split(geom)
-                    ]
-                except ValueError:
-                    raise ValueError(
-                        'Could not coerce `str` to a list of `float`s'
-                    )
-                else:
-                    if not len(coords) % 2 == 0:
-                        raise ValueError(
-                            'Got an odd number of coordinate values'
-                        )
-                    else:
-                        # Construct WKT from the coords
-                        # NOTE: ordering is expected to be lon,lat
-                        points = ['%s %s' % (coords[i], coords[i + 1])
-                                  for i in xrange(0, len(coords), 2)]
-                        # if this is the region, close the linear polygon
-                        # ring by appending the first coord to the end
-                        if field in ('region', 'region_constraint'):
-                            points.append(points[0])
-                        # update the field
-                        kwargs[field] = wkt_fmt % ', '.join(points)
+        coords = kwargs.get(field)
+        if coords:  # construct WKT from the coords
+            points = ['%s %s' % lon_lat for lon_lat in coords]
+            # if this is the region, close the linear polygon
+            # ring by appending the first coord to the end
+            if field in ('region', 'region_constraint'):
+                points.append(points[0])
+            # update the field
+            kw[field] = wkt_fmt % ', '.join(points)
+    return kw
 
-    # return the (possbily) modified kwargs
-    return kwargs
+
+class Imt(djm.Model):
+    """
+    Table with the Intensity Measure Types
+    """
+    imt_str = djm.TextField(null=False)
+    im_type = djm.TextField(choices=IMT_CHOICES)
+    sa_period = djm.FloatField(null=True)
+    sa_damping = djm.FloatField(null=True)
+    stored_imts = None
+
+    @classmethod
+    def get(cls, imt_str):
+        """
+        :param imt_str: a string specifying the IMT
+        :returns: a :class:`openquake.engine.db.models.Imt` instance
+        """
+        if cls.stored_imts is None:  # the first time
+            cls.stored_imts = {imt.imt_str: imt
+                               for imt in Imt.objects.filter()}
+        return cls.stored_imts[imt_str]
+
+    @classmethod
+    def save_new(cls, hazardlib_imts):
+        """
+        Save the intensity measure types not already stored in the database.
+
+        :param hazardlib_imts: a list of hazardlib IMT tuples
+        """
+        if cls.stored_imts is None:  # the first time
+            cls.stored_imts = {imt.imt_str: imt
+                               for imt in Imt.objects.filter()}
+        for x in hazardlib_imts:
+            imt_str = str(x)
+            if imt_str not in cls.stored_imts:
+                imt = cls.objects.create(
+                    imt_str=imt_str,
+                    im_type=x[0], sa_period=x[1], sa_damping=x[2])
+                cls.stored_imts[imt_str] = imt
+
+    class Meta:
+        db_table = 'hzrdi\".\"imt'
+
+
+class ImtTaxonomy(djm.Model):
+    """
+    Table with the associations IMT, taxonomy, as extracted from the risk
+    models.
+    """
+    job = djm.ForeignKey('OqJob', null=False)
+    imt = djm.ForeignKey('Imt', null=False)
+    taxonomy = djm.TextField(null=True)
+
+    class Meta:
+        db_table = 'riski\".\"imt_taxonomy'
 
 
 class OutputManager(djm.Manager):
@@ -1235,6 +856,7 @@ class Output(djm.Model):
 
     class Meta:
         db_table = 'uiapi\".\"output'
+        ordering = ['id']
 
     def is_hazard_curve(self):
         return self.output_type in ['hazard_curve', 'hazard_curve_multi']
@@ -1316,8 +938,8 @@ class Output(djm.Model):
         """
         investigation_time = self.oq_job\
                                  .risk_calculation\
-                                 .get_hazard_calculation()\
-                                 .investigation_time
+                                 .hazard_calculation\
+                                 .get_param('investigation_time', None)
 
         statistics, quantile = self.statistical_params
         gsim_lt_path, sm_lt_path = self.lt_realization_paths
@@ -1499,98 +1121,88 @@ class SESCollection(djm.Model):
     See also :class:`SES` and :class:`SESRupture`.
     """
     output = djm.OneToOneField('Output', related_name="ses")
-    lt_realization_ids = fields.IntArrayField(null=False)
+    trt_model = djm.OneToOneField(
+        'TrtModel', related_name='ses_collection', null=False)
     ordinal = djm.IntegerField(null=False)
 
     class Meta:
         db_table = 'hzrdr\".\"ses_collection'
         ordering = ['ordinal']
 
-    def __iter__(self):
+    @classmethod
+    def create(cls, output):
         """
-        Iterator for walking through all child :class:`SES` objects.
+        Create an LtSourceModel, a TrtModel and a SESCollection associated
+        to it and to the given output.
+
+        :param output: an output of type GMF
         """
-        return SES.objects.filter(ses_collection=self.id).order_by('ordinal') \
-            .iterator()
+        lt_model = LtSourceModel.objects.create(
+            hazard_calculation=output.oq_job, ordinal=0,
+            sm_lt_path=[], sm_name='fake-from-rupture', weight=1)
+        # in order to save a ProbabilisticRupture, a TrtModel is needed;
+        # here we generate a fake one, corresponding to the tectonic
+        # region type NA i.e. Not Available
+        trt_model = TrtModel.objects.create(
+            lt_model=lt_model, tectonic_region_type='NA', num_sources=0,
+            num_ruptures=1, min_mag=0, max_mag=0, gsims=[])
+        return cls.objects.create(
+            output=output, trt_model=trt_model, ordinal=0)
 
     @property
     def sm_lt_path(self):
         """
         The source model logic tree path corresponding to the collection
         """
-        # all lt_realization_ids correspond to the same sm_lt_path
-        return LtRealization.objects.get(
-            pk=self.lt_realization_ids[0]).sm_lt_path
+        return tuple(self.trt_model.lt_model.sm_lt_path)
 
-    @property
-    def weight(self):
+    def get_ruptures(self):
+        """Return the SESRuptures associated to self"""
+        return SESRupture.objects.filter(rupture__ses_collection=self.id)
+
+    def __iter__(self):
         """
-        The logic tree weight corresponding to the collection
+        Iterator for walking through all child :class:`SES` objects.
         """
-        weights = [LtRealization.objects.get(pk=rlz_id).weight
-                   for rlz_id in self.lt_realization_ids]
-        if all(w is None for w in weights):
-            return None
-        else:
-            return sum(weights)
+        n = self.output.oq_job.get_param('ses_per_logic_tree_path', 1)
+        for ordinal in xrange(1, n + 1):  # 1 for scenario
+            yield SES(self, ordinal)
+
+    def __len__(self):
+        """
+        Return the ses_per_logic_tree_path parameter
+        """
+        return self.output.oq_job.get_param('ses_per_logic_tree_path', 1)
+
+    def __repr__(self):
+        return '<%s=%d, trt_model=%s, ordinal=%d>' % (
+            self.__class__.__name__, self.id, self.trt_model.id, self.ordinal)
 
 
-class SES(djm.Model):
+class SES(object):
     """
     Stochastic Event Set: A container for 1 or more ruptures associated with a
     specific investigation time span.
-
-    See also :class:`SESRupture`.
     """
-    ses_collection = djm.ForeignKey('SESCollection')
-    investigation_time = djm.FloatField()
-    # Order number of this Stochastic Event Set in a series of SESs
-    # (for a given logic tree realization).
-    ordinal = djm.IntegerField(null=True)
+    # the ordinal must be > 0: the reason is that it appears in the
+    # exported XML file and the schema constraints the number to be
+    # nonzero
+    def __init__(self, ses_collection, ordinal=1):
+        self.ses_collection = ses_collection
+        self.ordinal = ordinal
+        self.investigation_time = self.ses_collection.output.oq_job.get_param(
+            'investigation_time', None)
 
-    class Meta:
-        db_table = 'hzrdr\".\"ses'
-        ordering = ['ordinal']
+    def __cmp__(self, other):
+        return cmp(self.ordinal, other.ordinal)
 
     def __iter__(self):
         """
         Iterator for walking through all child :class:`SESRupture` objects.
         """
-        return SESRupture.objects.filter(ses=self.id).order_by('tag') \
-            .iterator()
-
-
-def is_from_fault_source(rupture):
-    """
-    If True, this rupture was generated from a simple/complex fault
-    source. If False, this rupture was generated from a point/area source.
-
-    :param rupture: an instance of :class:
-    `openquake.hazardlib.source.rupture.BaseProbabilisticRupture`
-    """
-    typology = rupture.source_typology
-    is_char = typology is source.CharacteristicFaultSource
-    is_complex_or_simple = typology in (
-        source.ComplexFaultSource,
-        source.SimpleFaultSource)
-    is_complex_or_simple_surface = isinstance(
-        rupture.surface, (geo.ComplexFaultSurface,
-                          geo.SimpleFaultSurface))
-    return is_complex_or_simple or (
-        is_char and is_complex_or_simple_surface)
-
-
-def is_multi_surface(rupture):
-    """
-    :param rupture: an instance of :class:
-    `openquake.hazardlib.source.rupture.BaseProbabilisticRupture`
-
-    :returns: a boolean
-    """
-    typology = rupture.source_typology
-    is_char = typology is source.CharacteristicFaultSource
-    is_multi_sur = isinstance(rupture.surface, geo.MultiSurface)
-    return is_char and is_multi_sur
+        return SESRupture.objects.filter(
+            rupture__ses_collection=self.ses_collection.id,
+            ses_id=self.ordinal).order_by('tag').iterator()
 
 
 def get_geom(surface, is_from_fault_source, is_multi_surface):
@@ -1661,53 +1273,66 @@ def get_geom(surface, is_from_fault_source, is_multi_surface):
     return lons, lats, depths
 
 
-class SESRupture(djm.Model):
+class ProbabilisticRupture(djm.Model):
     """
-    A rupture as part of a Stochastic Event Set.
+    A rupture as part of a Stochastic Event Set Collection.
     """
-    ses = djm.ForeignKey('SES')
+    ses_collection = djm.ForeignKey('SESCollection')
     magnitude = djm.FloatField(null=False)
-    hypocenter = djm.PointField(srid=DEFAULT_SRID)
-    tag = djm.TextField(null=False)
+    _hypocenter = fields.FloatArrayField(null=False)
     rake = djm.FloatField(null=False)
-    tectonic_region_type = djm.TextField(null=False)
     is_from_fault_source = djm.NullBooleanField(null=False)
     is_multi_surface = djm.NullBooleanField(null=False)
     surface = fields.PickleField(null=False)
+    site_indices = fields.IntArrayField(null=True)
+
+    # NB (MS): the proper solution would be to store the hypocenter as a 3D
+    # point, however I was unable to do so, due to a bug in Django 1.3
+    # (I was getting a GeometryProxy exception).
+    # The GEOS library we are using does not even support
+    # the WKT for 3D points; that's why I am storing the point as a
+    # 3D array, as a workaround; luckily, we never perform any
+    # geospatial query on the hypocenter.
+    # we will be able to do better when we will upgrade (Geo)Django
+    @property
+    def hypocenter(self):
+        """Convert the 3D array into a hazardlib point"""
+        return geo.Point(*self._hypocenter)
 
     class Meta:
-        db_table = 'hzrdr\".\"ses_rupture'
-        ordering = ['tag']
+        db_table = 'hzrdr\".\"probabilistic_rupture'
 
     @classmethod
-    def create(cls, rupture, ses, source_id, occ):
+    def create(cls, rupture, ses_collection, site_indices=None):
         """
-        Create a ses_rupture row on the database.
+        Create a ProbabilisticRupture row on the database.
 
         :param rupture:
             a hazardlib rupture
-        :param ses:
-            a Stochastic Event Set object
-        :param source_id:
-            the source generating the rupture
-        :param occ:
-            occurrency number
+        :param ses_collection:
+            a Stochastic Event Set Collection object
+        :param site_indices:
+            an array of indices for the site_collection
         """
-        iffs = is_from_fault_source(rupture)
-        ims = is_multi_surface(rupture)
+        iffs = isinstance(rupture.surface,
+                          (geo.ComplexFaultSurface, geo.SimpleFaultSurface))
+        ims = isinstance(rupture.surface, geo.MultiSurface)
         lons, lats, depths = get_geom(rupture.surface, iffs, ims)
+        hp = rupture.hypocenter
         return cls.objects.create(
-            ses=ses,
+            ses_collection=ses_collection,
             magnitude=rupture.mag,
             rake=rupture.rake,
-            tectonic_region_type=rupture.tectonic_region_type,
             is_from_fault_source=iffs,
             is_multi_surface=ims,
             surface=rupture.surface,
-            tag='smlt=%02d|ses=%04d|src=%s|occ=%02d'
-            % (ses.ses_collection.ordinal, ses.ordinal, source_id, occ),
-            hypocenter=rupture.hypocenter.wkt2d,
-            )
+            _hypocenter=[hp.longitude, hp.latitude, hp.depth],
+            site_indices=site_indices)
+
+    @property
+    def tectonic_region_type(self):
+        """The TRT associated to the underlying trt_model"""
+        return self.ses_collection.trt_model.tectonic_region_type
 
     _geom = None
 
@@ -1742,6 +1367,10 @@ class SESRupture(djm.Model):
     @property
     def dip(self):
         return self.surface.get_dip()
+
+    @property
+    def mag(self):
+        return self.magnitude
 
     def _validate_planar_surface(self):
         """
@@ -1786,10 +1415,77 @@ class SESRupture(djm.Model):
         return None
 
 
-class _Point(object):
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
+class SESRupture(djm.Model):
+    """
+    A rupture as part of a Stochastic Event Set.
+    """
+    rupture = djm.ForeignKey('ProbabilisticRupture')
+    ses_id = djm.IntegerField(null=False)
+    tag = djm.TextField(null=False)
+    seed = djm.IntegerField(null=False)
+
+    class Meta:
+        db_table = 'hzrdr\".\"ses_rupture'
+        ordering = ['tag']
+
+    @classmethod
+    def create(cls, prob_rupture, ses_ordinal, source_id, rupt_no, rupt_occ,
+               seed):
+        """
+        Create a SESRupture row in the database.
+
+        :param prob_rupture:
+            :class:`openquake.engine.db.models.ProbabilisticRupture` instance
+        :param int ses_ordinal:
+            ordinal for a :class:`openquake.engine.db.models.SES` instance
+        :param str source_id:
+            id of the source that generated the rupture
+        :param rupt_no:
+            the rupture number (an ordinal from source.iter_ruptures())
+        :param rupt_occ:
+            the occurrence number of the rupture in the given ses
+        :param int seed:
+            a seed that will be used when computing the GMF from the rupture
+        """
+        tag = 'trt=%02d|ses=%04d|src=%s|rup=%03d-%02d' % (
+            prob_rupture.ses_collection.ordinal, ses_ordinal,
+            source_id, rupt_no, rupt_occ)
+        return cls.objects.create(
+            rupture=prob_rupture, ses_id=ses_ordinal, tag=tag, seed=seed)
+
+    @property
+    def surface(self):
+        """The surface of the underlying rupture"""
+        return self.rupture.surface
+
+    @property
+    def hypocenter(self):
+        """The hypocenter of the underlying rupture"""
+        return self.rupture.hypocenter
+
+
+_Point = collections.namedtuple('_Point', 'x y')
+
+
+def get_correl_model(job):
+    """
+    Helper function for constructing the appropriate correlation model.
+
+    :returns:
+        A correlation object. See :mod:`openquake.hazardlib.correlation`
+        for more info.
+    """
+    correl_model_name = job.get_param('ground_motion_correlation_model', None)
+    if correl_model_name is None:
+        # There's no correlation model for this calculation.
+        return None
+    correl_model_cls = getattr(
+        correlation, '%sCorrelationModel' % correl_model_name, None)
+    if correl_model_cls is None:
+        # There's no correlation model for this calculation.
+        return None
+    gmc_params = job.get_param('ground_motion_correlation_params', None)
+    return correl_model_cls(**gmc_params)
 
 
 class Gmf(djm.Model):
@@ -1803,7 +1499,89 @@ class Gmf(djm.Model):
     class Meta:
         db_table = 'hzrdr\".\"gmf'
 
-    # this part is tested in models_test:GmfsPerSesTestCase
+    def by_rupture(self, sitecol, ses_collection_id=None, ses_ordinal=None):
+        """
+        Yields triples (ses_rupture, sites, gmf_dict)
+        """
+        job = self.output.oq_job
+        imtls = job.get_param('intensity_measure_types_and_levels')
+        truncation_level = job.get_param('truncation_level', None)
+        correl_model = get_correl_model(job)
+        gsims = self.lt_realization.get_gsim_instances()
+        assert gsims, 'No GSIMs found for realization %d!' % \
+            self.lt_realization.id  # look into hzdr.assoc_lt_rlz_trt_model
+
+        # NB: the IMTs must be sorted for consistency with the classical
+        # calculator when computing the hazard curves from the GMFs
+        imts = map(from_string, sorted(imtls))
+        for ses_coll in SESCollection.objects.filter(
+                output__oq_job=self.output.oq_job):
+            # filter by ses_collection
+            if ses_collection_id and ses_collection_id != ses_coll.id:
+                continue
+            for ses in ses_coll:
+                # filter by ses_ordinal
+                if ses_ordinal and ses_ordinal != ses.ordinal:
+                    continue
+                for rupture, ses_ruptures in itertools.groupby(
+                        ses, operator.attrgetter('rupture')):
+                    sites = sitecol if rupture.site_indices is None\
+                        else FilteredSiteCollection(
+                            rupture.site_indices, sitecol)
+                    computer = calc.gmf.GmfComputer(
+                        rupture, sites, imts, gsims,
+                        truncation_level, correl_model)
+                    for ses_rup in ses_ruptures:
+                        yield ses_rup, sites, computer.compute(ses_rup.seed)
+
+    # this method in the future will replace __iter__, by enabling
+    # GMF-export by recomputation
+    def iternew(self):
+        """
+        Get the ground motion fields per SES ("GMF set") for
+        the XML export. Each "GMF set" should:
+
+            * have an `investigation_time` attribute
+            * have an `stochastic_event_set_id` attribute
+            * be iterable, yielding a sequence of "GMF" objects
+
+            Each "GMF" object should:
+
+            * have an `imt` attribute
+            * have an `sa_period` attribute (only if `imt` is 'SA')
+            * have an `sa_damping` attribute (only if `imt` is 'SA')
+            * have a `rupture_id` attribute (to indicate which rupture
+              contributed to this gmf)
+            * be iterable, yielding a sequence of "GMF node" objects
+
+            Each "GMF node" object should have:
+
+            * a `gmv` attribute (to indicate the ground motion value
+            * `lon` and `lat` attributes (to indicate the geographical location
+              of the ground motion field)
+
+        If a SES does not generate any GMF, it is ignored.
+        """
+        for ses_coll in SESCollection.objects.filter(
+                output__oq_job=self.output.oq_job):
+            for ses in ses_coll:
+                gmfset = []  # set of GMFs generate by the same SES
+                for ses_rup, sites, gmf_dict in self.by_rupture(
+                        ses_coll.id, ses.ordinal):
+                    for gsim, imt in gmf_dict:
+                        gmvs = gmf_dict[gsim, imt]
+                        im_type, sa_period, sa_damping = imt
+                            # using a generator here saves a lot of memory
+                        nodes = (_GroundMotionFieldNode(gmv, _Point(x, y))
+                                 for gmv, x, y in
+                                 zip(gmvs, sites.lons, sites.lats))
+                        gmfset.append(
+                            _GroundMotionField(
+                                im_type, sa_period, sa_damping,
+                                ses_rup.tag, nodes))
+                if gmfset:
+                    yield GmfSet(ses, gmfset)
+
     def __iter__(self):
         """
         Get the ground motion fields per SES ("GMF set") for
@@ -1830,37 +1608,54 @@ class Gmf(djm.Model):
 
         If a SES does not generate any GMF, it is ignored.
         """
-        hc = self.output.oq_job.hazard_calculation
-        for ses in SES.objects.filter(
-                ses_collection__output__oq_job=self.output.oq_job):
-            query = """
+        job = self.output.oq_job
+        for ses_coll in SESCollection.objects.filter(output__oq_job=job):
+            for ses in ses_coll:
+                query = """\
         SELECT imt, sa_period, sa_damping, tag,
                array_agg(gmv) AS gmvs,
                array_agg(ST_X(location::geometry)) AS xs,
                array_agg(ST_Y(location::geometry)) AS ys
         FROM (SELECT imt, sa_period, sa_damping,
-             unnest(rupture_ids) as rupture_id, location, unnest(gmvs) AS gmv
+             unnest(rupture_ids) as rupture_id, location,
+             unnest(gmvs) AS gmv
            FROM hzrdr.gmf_data, hzrdi.hazard_site
-           WHERE site_id = hzrdi.hazard_site.id AND hazard_calculation_id=%s
-           AND gmf_id=%d) AS x, hzrdr.ses_rupture AS y
-        WHERE x.rupture_id = y.id AND y.ses_id=%d
+             WHERE site_id = hzrdi.hazard_site.id
+             AND hazard_calculation_id=%s
+             AND gmf_id=%d) AS x, hzrdr.ses_rupture AS y,
+           hzrdr.probabilistic_rupture AS z
+        WHERE x.rupture_id = y.id AND y.rupture_id=z.id
+        AND y.ses_id=%d AND z.ses_collection_id=%d
         GROUP BY imt, sa_period, sa_damping, tag
         ORDER BY imt, sa_period, sa_damping, tag;
-        """ % (hc.id, self.id, ses.id)
-            with transaction.commit_on_success(using='job_init'):
-                curs = getcursor('job_init')
-                curs.execute(query)
-            # a set of GMFs generate by the same SES, one per rupture
-            gmfset = []
-            for imt, sa_period, sa_damping, rupture_tag, gmvs, xs, ys in curs:
-                # using a generator here saves a lot of memory
-                nodes = (_GroundMotionFieldNode(gmv, _Point(x, y))
-                         for gmv, x, y in zip(gmvs, xs, ys))
-                gmfset.append(
-                    _GroundMotionField(
-                        imt, sa_period, sa_damping, rupture_tag, nodes))
-            if gmfset:
-                yield GmfSet(ses, gmfset)
+        """ % (job.id, self.id, ses.ordinal, ses_coll.id)
+                gmfset = self.gmfset(ses, query)
+                if gmfset:
+                    yield gmfset
+
+    def gmfset(self, ses, query):
+        """
+        :param ses:
+            a :class:`openquake.engine.db.models.SES` instance
+        :param query:
+            the query to extract the ground motion fields,
+            one per each rupture tag
+        :returns:
+            a :class:`openquake.engine.db.models.GmfSet` instance
+        """
+        curs = getcursor('job_init')
+        curs.execute(query)
+        # a set of GMFs generate by the same SES, one per rupture
+        gmfset = []
+        for (imt, sa_period, sa_damping, rupture_tag, gmvs,
+             xs, ys) in curs:
+            # using a generator here saves a lot of memory
+            nodes = (_GroundMotionFieldNode(gmv, _Point(x, y))
+                     for gmv, x, y in zip(gmvs, xs, ys))
+            gmfset.append(
+                _GroundMotionField(
+                    imt, sa_period, sa_damping, rupture_tag, nodes))
+        return GmfSet(ses, gmfset)
 
 
 class GmfSet(object):
@@ -1868,20 +1663,23 @@ class GmfSet(object):
     Small wrapper around the list of Gmf objects associated to the given SES.
     """
     def __init__(self, ses, gmfset):
-        self.ses = ses
         self.gmfset = gmfset
-        self.investigation_time = ses.investigation_time
+        self.investigation_time = ses.investigation_time or 0
         self.stochastic_event_set_id = ses.ordinal
 
     def __iter__(self):
         return iter(self.gmfset)
 
+    def __nonzero__(self):
+        return bool(self.gmfset)
+
     def __str__(self):
         return (
             'GMFsPerSES(investigation_time=%f, '
             'stochastic_event_set_id=%s,\n%s)' % (
-                self.ses.investigation_time,
-                self.ses.ordinal, '\n'.join(str(g) for g in self.gmfset)))
+                self.investigation_time,
+                self.stochastic_event_set_id, '\n'.join(
+                    sorted(str(g) for g in self.gmfset))))
 
 
 class _GroundMotionField(object):
@@ -1922,8 +1720,15 @@ class _GroundMotionFieldNode(object):
         self.gmv = gmv
         self.location = loc
 
+    def __lt__(self, other):
+        """
+        A reproducible ordering by lon and lat; used in
+        :function:`openquake.commonlib.hazard_writers.gen_gmfs`
+        """
+        return self.location < other.location
+
     def __str__(self):
-        "Return lon, lat and gmv of the node in a compact string form"
+        """Return lon, lat and gmv of the node in a compact string form"""
         return '<X=%9.5f, Y=%9.5f, GMV=%9.7f>' % (
             self.location.x, self.location.y, self.gmv)
 
@@ -1948,72 +1753,32 @@ class GmfData(djm.Model):
         ordering = ['gmf', 'task_no']
 
 
-def get_gmvs_per_site(output, imt=None, sort=sorted):
+def get_gmvs_per_site(output, imt):
     """
     Iterator for walking through all :class:`GmfData` objects associated
     to a given output. Notice that values for the same site are
-    displayed together and then ordered according to the iml, so that
-    it is possible to get reproducible outputs in the test cases.
+    displayed together and ordered according to the rupture ids, so that
+    it is possible to get consistent outputs in the test cases.
 
     :param output: instance of :class:`openquake.engine.db.models.Output`
-
-    :param string imt: a string with the IMT to extract; the default
-                       is None, all the IMT in the job.ini file are extracted
-
-    :param sort: callable used for sorting the list of ground motion values.
-
+    :param string imt: a string with the IMT to extract
     :returns: a list of ground motion values per each site
     """
-    job = output.oq_job
-    hc = job.hazard_calculation
-    coll = output.gmf
-    if imt is None:
-        imts = [from_string(x) for x in hc.intensity_measure_types]
+    imtype, sa_period, sa_damping = from_string(imt)
+    gmf_id = output.gmf.id
+    curs = getcursor('job_init')
+    query = '''\
+    SELECT site_id, array_concat(gmvs), array_concat(rupture_ids)
+    FROM hzrdr.gmf_data WHERE gmf_id=%s AND imt=%s {}
+    GROUP BY site_id ORDER BY site_id'''
+    if imtype == 'SA':
+        curs.execute(query.format('AND sa_period=%s AND sa_damping=%s'),
+                     (gmf_id, imtype, sa_period, sa_damping))
     else:
-        imts = [from_string(imt)]
-    for imt, sa_period, sa_damping in imts:
-        for gmf in GmfData.objects.filter(
-                gmf=coll, imt=imt,
-                sa_period=sa_period, sa_damping=sa_damping).\
-                order_by('site'):
-            yield sort(gmf.gmvs)
-
-
-def get_gmfs_scenario(output, imt=None):
-    """
-    Iterator for walking through all :class:`GmfData` objects associated
-    to a given output. Notice that the fields are ordered according to the
-    location, so it is possible to get reproducible outputs in the test cases.
-
-    :param output: instance of :class:`openquake.engine.db.models.Output`
-
-    :param string imt: a string with the IMT to extract; the default
-                       is None, all the IMT in the job.ini file are extracted
-
-    :returns: an iterator over
-              :class:`openquake.engine.db.models._GroundMotionField` instances
-    """
-    job = output.oq_job
-    hc = job.hazard_calculation
-    coll = output.gmf
-    if imt is None:
-        imts = [from_string(x) for x in hc.intensity_measure_types]
-    else:
-        imts = [from_string(imt)]
-    for imt, sa_period, sa_damping in imts:
-        nodes = collections.defaultdict(list)  # realization -> gmf_nodes
-        for gmf in GmfData.objects.filter(
-                gmf=coll, imt=imt,
-                sa_period=sa_period, sa_damping=sa_damping):
-            for i, gmv in enumerate(gmf.gmvs):  # i is the realization index
-                nodes[i].append(_GroundMotionFieldNode(gmv, gmf.site.location))
-        for gmf_nodes in nodes.itervalues():
-            yield _GroundMotionField(
-                imt=imt,
-                sa_period=sa_period,
-                sa_damping=sa_damping,
-                rupture_id=None,
-                gmf_nodes=sorted(gmf_nodes, key=operator.attrgetter('gmv')))
+        curs.execute(query.format(''), (gmf_id, imtype))
+    for site_id, gmvs, rup_ids in curs:
+        gmv = dict(zip(rup_ids, gmvs))
+        yield [gmv[r] for r in sorted(rup_ids)]
 
 
 class DisaggResult(djm.Model):
@@ -2112,24 +1877,170 @@ class UHSData(djm.Model):
         db_table = 'hzrdr\".\"uhs_data'
 
 
+class LtSourceModel(djm.Model):
+    """
+    Identify a logic tree source model.
+    """
+    hazard_calculation = djm.ForeignKey('OqJob')
+    ordinal = djm.IntegerField()
+    sm_lt_path = fields.CharArrayField()
+    sm_name = djm.TextField(null=False)
+    weight = djm.DecimalField(decimal_places=100, max_digits=101, null=True)
+
+    class Meta:
+        db_table = 'hzrdr\".\"lt_source_model'
+        ordering = ['ordinal']
+
+    def get_num_sources(self):
+        """
+        Return the number of sources in the model.
+        """
+        return sum(info.num_sources for info in self.trtmodel_set.all())
+
+    def get_tectonic_region_types(self):
+        """
+        Return the tectonic region types in the model,
+        ordered by number of sources.
+        """
+        return self.trtmodel_set.filter(
+            lt_model=self, num_ruptures__gt=0).values_list(
+            'tectonic_region_type', flat=True)
+
+    def make_gsim_lt(self, trts=()):
+        """
+        Helper to instantiate a GsimLogicTree object from the logic tree file.
+        """
+        hc = self.hazard_calculation.get_oqparam()
+        trts = trts or self.get_tectonic_region_types()
+        fname = os.path.join(hc.base_path, hc.inputs['gsim_logic_tree'])
+        gsim_lt = logictree.GsimLogicTree(
+            fname, 'applyToTectonicRegionType', trts)
+        for trt in trts:
+            if not trt in gsim_lt.values:
+                raise ValueError(
+                    "Found in %r a tectonic region type %r inconsistent with "
+                    "the ones in %r" % (self.sm_name, trt, fname))
+        return gsim_lt
+
+    def __iter__(self):
+        """
+        Yield the realizations corresponding to the given model
+        """
+        return iter(self.ltrealization_set.all())
+
+
+class TrtModel(djm.Model):
+    """
+    Source submodel containing sources of the same tectonic region type.
+    """
+    lt_model = djm.ForeignKey('LtSourceModel')
+    tectonic_region_type = djm.TextField(null=False)
+    num_sources = djm.IntegerField(null=False)
+    num_ruptures = djm.IntegerField(null=False)
+    min_mag = djm.FloatField(null=False)
+    max_mag = djm.FloatField(null=False)
+    gsims = fields.CharArrayField(null=True)
+
+    def get_realizations(self, gsim_name):
+        """
+        Return the realizations associated to the current TrtModel and
+        the given GSIM.
+
+        :param str gsim_name: name of a GSIM class
+        """
+        assert gsim_name in self.gsims, gsim_name
+        for art in AssocLtRlzTrtModel.objects.filter(
+                trt_model=self.id, gsim=gsim_name):
+            yield art.rlz
+
+    def get_rlzs_by_gsim(self):
+        """
+        Return the realizations associated to the current TrtModel
+        as an ordered dictionary {gsim_name: [rlz, ...]}
+        """
+        dic = collections.defaultdict(list)
+        for art in AssocLtRlzTrtModel.objects.filter(trt_model=self.id):
+            dic[art.gsim].append(art.rlz)
+        return collections.OrderedDict(
+            (gsim, dic[gsim]) for gsim in sorted(dic))
+
+    def get_gsim_instances(self):
+        """
+        Return the GSIM instances associated to the current TrtModel
+        """
+        return [logictree.GSIM[gsim]() for gsim in self.gsims]
+
+    class Meta:
+        db_table = 'hzrdr\".\"trt_model'
+        ordering = ['id']
+        # NB: the TrtModels are built in the right order, see
+        # BaseHazardCalculator.initialize_sources
+
+
+class SourceInfo(djm.Model):
+    """
+    Source specific infos
+    """
+    trt_model = djm.ForeignKey('TrtModel')
+    source_id = djm.TextField(null=False)
+    source_class = djm.TextField(null=False)
+    num_sites = djm.IntegerField(null=False)
+    num_ruptures = djm.IntegerField(null=False)
+    occ_ruptures = djm.IntegerField(null=True)
+    uniq_ruptures = djm.IntegerField(null=True)
+    calc_time = djm.FloatField(null=False)
+
+    class Meta:
+        db_table = 'hzrdr\".\"source_info'
+        ordering = ['trt_model', 'source_id']
+
+
+class AssocLtRlzTrtModel(djm.Model):
+    """
+    Associations between logic tree realizations and TrtModels. Fixed
+    a realization and a TRT, the gsim is unique.
+    """
+    rlz = djm.ForeignKey('LtRealization')
+    trt_model = djm.ForeignKey('TrtModel')
+    gsim = djm.TextField(null=False)
+
+    class Meta:
+        db_table = 'hzrdr\".\"assoc_lt_rlz_trt_model'
+        ordering = ['id']
+
+
 class LtRealization(djm.Model):
     """
     Identify a logic tree branch.
     """
 
-    hazard_calculation = djm.ForeignKey('HazardCalculation')
+    lt_model = djm.ForeignKey('LtSourceModel')
     ordinal = djm.IntegerField()
-    seed = djm.IntegerField()
     weight = djm.DecimalField(decimal_places=100, max_digits=101)
-    sm_lt_path = fields.CharArrayField()
     gsim_lt_path = fields.CharArrayField()
+
+    @property
+    def sm_lt_path(self):
+        """
+        The source model logic tree path extracted from the underlying
+        source model
+        """
+        return self.lt_model.sm_lt_path
 
     class Meta:
         db_table = 'hzrdr\".\"lt_realization'
+        ordering = ['ordinal']
+
+    def get_gsim_instances(self):
+        """
+        Return the GSIM instances associated to the current realization
+        by looking at the association table.
+        """
+        return [logictree.GSIM[art.gsim]() for art in
+                AssocLtRlzTrtModel.objects.filter(rlz=self)]
 
 
 ## Tables in the 'riskr' schema.
-
 
 class LossFraction(djm.Model):
     """
@@ -2343,6 +2254,13 @@ class LossFractionData(djm.Model):
     def assertAlmostEqual(self, data):
         return risk_almost_equal(
             self, data, operator.attrgetter('absolute_loss'))
+
+    def to_csv_str(self):
+        """
+        Convert LossFractionData into a CSV string
+        """
+        return '%.5f,%.5f,%s,%s' % (
+            self.location.x, self.location.y, self.value, self.absolute_loss)
 
 
 class LossMap(djm.Model):
@@ -2598,6 +2516,13 @@ class EventLoss(djm.Model):
     def __iter__(self):
         return iter(self.eventlossdata_set.all().order_by('-aggregate_loss'))
 
+    def to_csv_str(self):
+        """
+        Convert EventLoss into a CSV with fields rupture_tag, aggregate_loss
+        """
+        return '\n'.join('%s,%s' % (self.rupture.tag, self.aggregate_loss)
+                         for data in self)
+
     @property
     def output_hash(self):
         """
@@ -2633,7 +2558,8 @@ class EventLossData(djm.Model):
         """
         Convert EventLossData into a CSV string
         """
-        return '%s,%s' % (self.rupture.id, self.aggregate_loss)
+        return '%s,%s,%s' % (self.rupture.tag, self.rupture.rupture.mag,
+                             self.aggregate_loss)
 
 
 class BCRDistribution(djm.Model):
@@ -2885,7 +2811,7 @@ class ExposureModel(djm.Model):
             for computing losses for `loss_type`
         """
         if loss_type != "fatalities":
-            ct = cost_type(loss_type)
+            ct = loss_type_to_cost_type(loss_type)
             return self.exposuredata_set.filter(
                 cost__cost_type__name=ct).exists()
         else:
@@ -2940,7 +2866,8 @@ class AssetManager(djm.GeoManager):
     Asset manager
     """
 
-    def get_asset_chunk(self, rc, taxonomy, offset, size):
+    def get_asset_chunk(self, rc, taxonomy, offset=0, size=None,
+                        asset_ids=None):
         """
         :returns:
 
@@ -2957,10 +2884,11 @@ class AssetManager(djm.GeoManager):
         """
 
         query, args = self._get_asset_chunk_query_args(
-            rc, taxonomy, offset, size)
+            rc, taxonomy, offset, size, asset_ids)
         return list(self.raw(query, args))
 
-    def _get_asset_chunk_query_args(self, rc, taxonomy, offset, size):
+    def _get_asset_chunk_query_args(
+            self, rc, taxonomy, offset, size, asset_ids):
         """
         Build a parametric query string and the corresponding args for
         #get_asset_chunk
@@ -2972,8 +2900,13 @@ class AssetManager(djm.GeoManager):
             self._get_people_query_helper(
                 rc.exposure_model.category, rc.time_event))
 
-        args += occupants_args + (size, offset)
+        args += occupants_args
 
+        if asset_ids is None:
+            assets_cond = 'true'
+        else:
+            assets_cond = 'riski.exposure_data.id IN (%s)' % ', '.join(
+                map(str, asset_ids))
         cost_type_fields, cost_type_joins = self._get_cost_types_query_helper(
             rc.exposure_model.costtype_set.all())
 
@@ -2988,16 +2921,19 @@ class AssetManager(djm.GeoManager):
             WHERE exposure_model_id = %s AND
                   taxonomy = %s AND
                   ST_COVERS(ST_GeographyFromText(%s), site) AND
-                  {occupants_cond}
+                  {occupants_cond} AND {assets_cond}
             GROUP BY riski.exposure_data.id
             ORDER BY ST_X(geometry(site)), ST_Y(geometry(site))
-            LIMIT %s OFFSET %s
             """.format(people_field=people_field,
                        occupants_cond=occupants_cond,
+                       assets_cond=assets_cond,
                        costs=cost_type_fields,
                        costs_join=cost_type_joins,
                        occupancy_join=occupancy_join)
-
+        if offset:
+            query += 'OFFSET %d ' % offset
+        if size is not None:
+            query += 'LIMIT %d' % size
         return query, args
 
     def _get_people_query_helper(self, category, time_event):
@@ -3104,6 +3040,7 @@ class ExposureData(djm.Model):
 
     class Meta:
         db_table = 'riski\".\"exposure_data'
+        ordering = ['asset_ref']
 
     def __str__(self):
         return "%s (%s-%s @ %s)" % (
@@ -3159,7 +3096,6 @@ class ExposureData(djm.Model):
         """
         if loss_type == "fatalities":
             return getattr(self, "people")
-
         return getattr(self, loss_type)
 
     def retrofitted(self, loss_type):
@@ -3224,8 +3160,67 @@ class HazardSite(djm.Model):
     parameters are use for all points of interest).
     """
 
-    hazard_calculation = djm.ForeignKey('HazardCalculation')
+    hazard_calculation = djm.ForeignKey('OqJob')
     location = djm.PointField(srid=DEFAULT_SRID)
 
     class Meta:
         db_table = 'hzrdi\".\"hazard_site'
+
+
+class AssetSite(djm.Model):
+    """
+    Contains the association exposure_data_id -> site_id, as generated
+    by the current risk job.
+    """
+    job = djm.ForeignKey('OqJob', null=False)
+    asset = djm.ForeignKey('ExposureData', null=False)
+    site = djm.ForeignKey('HazardSite', null=False)
+
+    class Meta:
+        db_table = 'riskr\".\"asset_site'
+        ordering = ['asset']
+
+    def __repr__(self):
+        return '<%s=%d, (%d, %d)>' % (self.__class__.__name__,
+                                      self.id, self.asset.id, self.site.id)
+
+
+class Epsilon(djm.Model):
+    """
+    Contains the association (asset_site, ses_collection) -> epsilons,
+    as generated by the current risk job for event based and scenario
+    computations.
+    """
+    asset_site = djm.ForeignKey('AssetSite', null=False)
+    ses_collection = djm.ForeignKey('SESCollection', null=False)
+    epsilons = fields.FloatArrayField(null=False)
+
+    @classmethod
+    def saveall(cls, ses_coll, asset_sites, epsilon_matrix):
+        """
+        Insert the epsilon matrix associated to the given
+        SES collection for each asset_sites association.
+
+        :param ses_coll:
+            a :class:`openquake.engine.db.models.SESCollection` instance
+        :param asset_sites:
+            a list of :class:`openquake.engine.db.models.AssetSite` instances
+        :param epsilon_matrix:
+            a numpy matrix with NxE elements, where `N` is the number of assets
+            and `E` the number of events for the given SESCollection
+        """
+        assert len(asset_sites) == len(epsilon_matrix), (
+            len(asset_sites), len(epsilon_matrix))
+        data = [cls(asset_site=asset_site,
+                    ses_collection=ses_coll,
+                    epsilons=list(epsilons))
+                for asset_site, epsilons in zip(asset_sites, epsilon_matrix)]
+        return writer.CacheInserter.saveall(data)
+
+    class Meta:
+        db_table = 'riskr\".\"epsilon'
+        ordering = ['asset_site']
+
+    def __repr__(self):
+        return '<%s %r %r>' % (self.__class__.__name__, self.asset_site,
+                               self.ses_collection)

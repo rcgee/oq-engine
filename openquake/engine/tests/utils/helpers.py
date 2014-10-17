@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -20,7 +20,6 @@
 Helper functions for our unit and smoke tests.
 """
 
-import collections
 import functools
 import logging
 import mock as mock_module
@@ -35,23 +34,23 @@ import tempfile
 import textwrap
 import time
 
+from django.core import exceptions
+
 from openquake.hazardlib.source.rupture import ParametricProbabilisticRupture
 from openquake.hazardlib.geo import Point
 from openquake.hazardlib.geo.surface.planar import PlanarSurface
 from openquake.hazardlib.tom import PoissonTOM
-
-from django.core import exceptions
+from openquake.commonlib.general import writetmp as touch
+from openquake.commonlib import readini
 
 from openquake.engine.db import models
 from openquake.engine import engine
 from openquake.engine import logs
-from openquake.engine.utils import config, get_calculator_class
-from openquake.engine.job.validation import validate
-
+from openquake.engine.utils import config
 
 CD = os.path.dirname(__file__)  # current directory
 
-RUNNER = os.path.abspath(os.path.join(CD, '../../../../bin/openquake'))
+RUNNER = os.path.abspath(os.path.join(CD, '../../../../bin/oq-engine'))
 
 DATA_DIR = os.path.abspath(os.path.join(CD, '../data'))
 
@@ -115,37 +114,24 @@ def demo_file(file_name):
 
 
 def run_job(cfg, exports=None, hazard_calculation_id=None,
-            hazard_output_id=None):
+            hazard_output_id=None, **params):
     """
     Given the path to a job config file and a hazard_calculation_id
     or a output, run the job.
+
+    :returns: a calculator object
     """
     if exports is None:
         exports = []
 
     job = get_job(cfg, hazard_calculation_id=hazard_calculation_id,
-                  hazard_output_id=hazard_output_id)
+                  hazard_output_id=hazard_output_id, **params)
     job.is_running = True
     job.save()
 
-    models.JobStats.objects.create(oq_job=job)
+    logfile = os.path.join(tempfile.gettempdir(), 'qatest.log')
 
-    if hazard_calculation_id or hazard_output_id:
-        rc = job.risk_calculation
-        calc = get_calculator_class('risk', rc.calculation_mode)(job)
-        logs.set_level('ERROR')
-        job = engine._do_run_calc(job, exports, calc, 'risk')
-        job.is_running = False
-        job.save()
-    else:
-        hc = job.hazard_calculation
-        calc = get_calculator_class('hazard', hc.calculation_mode)(job)
-        logs.set_level('ERROR')
-        job = engine._do_run_calc(job, exports, calc, 'hazard')
-        job.is_running = False
-        job.save()
-
-    return job
+    return engine.run_calc(job, 'error', logfile, exports, job.job_type)
 
 
 def timeit(method):
@@ -275,28 +261,6 @@ def cleanup_loggers():
     sys.stderr = STDERR
 
 
-def touch(content=None, dir=None, prefix="tmp", suffix="tmp"):
-    """Create temporary file with the given content.
-
-    Please note: the temporary file must be deleted bu the caller.
-
-    :param string content: the content to write to the temporary file.
-    :param string dir: directory where the file should be created
-    :param string prefix: file name prefix
-    :param string suffix: file name suffix
-    :returns: a string with the path to the temporary file
-    """
-    if dir is not None:
-        if not os.path.exists(dir):
-            os.makedirs(dir)
-    fh, path = tempfile.mkstemp(dir=dir, prefix=prefix, suffix=suffix)
-    if content:
-        fh = os.fdopen(fh, "w")
-        fh.write(content)
-        fh.close()
-    return path
-
-
 class ConfigTestCase(object):
     """Class which contains various configuration- and environment-related
     testing helpers."""
@@ -306,7 +270,7 @@ class ConfigTestCase(object):
         os.environ.clear()
         # Move the local configuration file out of the way if it exists.
         # Otherwise the tests that follow will break.
-        local_path = "%s/openquake.cfg" % os.path.abspath(os.getcwd())
+        local_path = "%s/openquake.cfg" % os.path.abspath(config.OQDIR)
         if os.path.isfile(local_path):
             shutil.move(local_path, "%s.test_bakk" % local_path)
 
@@ -315,11 +279,11 @@ class ConfigTestCase(object):
         os.environ.update(self.orig_env)
         # Move the local configuration file back into place if it was stashed
         # away.
-        local_path = "%s/openquake.cfg" % os.path.abspath(os.getcwd())
+        local_path = "%s/openquake.cfg" % os.path.abspath(config.OQDIR)
         if os.path.isfile("%s.test_bakk" % local_path):
             shutil.move("%s.test_bakk" % local_path, local_path)
-        config.Config().cfg.clear()
-        config.Config()._load_from_file()
+        config.cfg.cfg.clear()
+        config.cfg._load_from_file()
 
     def prepare_config(self, section, data=None):
         """Set up a configuration with the given `max_mem` value."""
@@ -332,8 +296,8 @@ class ConfigTestCase(object):
             content = ""
         site_path = touch(content=textwrap.dedent(content))
         os.environ["OQ_SITE_CFG_PATH"] = site_path
-        config.Config().cfg.clear()
-        config.Config()._load_from_file()
+        config.cfg.cfg.clear()
+        config.cfg._load_from_file()
 
 
 def random_string(length=16):
@@ -344,159 +308,76 @@ def random_string(length=16):
     return result
 
 
-def deep_eq(a, b, decimal=7, exclude=None):
-    """Deep compare two objects for equality by traversing __dict__ and
-    __slots__.
-
-    Caution: This function will exhaust generators.
-
-    :param decimal:
-        Desired precision (digits after the decimal point) for numerical
-        comparisons.
-
-    :param exclude: a list of attributes that will be excluded when
-    traversing objects
-
-    :returns:
-        Return `True` or `False` (to indicate if objects are equal) and a `str`
-        message. If the two objects are equal, the message is empty. If the two
-        objects are not equal, the message indicates which part of the
-        comparison failed.
-    """
-    exclude = exclude or []
-
-    try:
-        _deep_eq(a, b, decimal=decimal, exclude=exclude)
-    except AssertionError, err:
-        return False, err.message
-    return True, ''
-
-
-def _deep_eq(a, b, decimal, exclude=None):
-    """Do the actual deep comparison. If the two items up for comparison are
-    not equal, a :exception:`AssertionError` is raised (to
-    :function:`deep_eq`).
-    """
-
-    exclude = exclude or []
-
-    def _test_dict(a, b):
-        """Compare `dict` types recursively."""
-        assert len(a) == len(b), (
-            "Dicts %(a)s and %(b)s do not have the same length."
-            " Actual lengths: %(len_a)s and %(len_b)s") % dict(
-            a=a, b=b, len_a=len(a), len_b=len(b))
-
-        for key in a:
-            if not key in exclude:
-                _deep_eq(a[key], b[key], decimal)
-
-    def _test_seq(a, b):
-        """Compare `list` or `tuple` types recursively."""
-        assert len(a) == len(b), (
-            "Sequences %(a)s and %(b)s do not have the same length."
-            " Actual lengths: %(len_a)s and %(len_b)s") % \
-            dict(a=a, b=b, len_a=len(a), len_b=len(b))
-
-        for i, item in enumerate(a):
-            _deep_eq(item, b[i], decimal)
-
-    # lists or tuples
-    if isinstance(a, (list, tuple)):
-        _test_seq(a, b)
-    # dicts
-    elif isinstance(a, dict):
-        _test_dict(a, b)
-    # objects with a __dict__
-    elif hasattr(a, '__dict__'):
-        assert a.__class__ == b.__class__, (
-            "%s and %s are different classes") % (a.__class__, b.__class__)
-        _test_dict(a.__dict__, b.__dict__)
-    # iterables (not strings)
-    elif isinstance(a, collections.Iterable) and not isinstance(a, str):
-        # If there's a generator or another type of iterable, treat it as a
-        # `list`. NOTE: Generators will be exhausted if you do this.
-        _test_seq(list(a), list(b))
-    # objects with __slots__
-    elif hasattr(a, '__slots__'):
-        assert a.__class__ == b.__class__, (
-            "%s and %s are different classes") % (a.__class__, b.__class__)
-        assert a.__slots__ == b.__slots__, (
-            "slots %s and %s are not the same") % (a.__slots__, b.__slots__)
-        for slot in a.__slots__:
-            if not slot in exclude:
-                _deep_eq(getattr(a, slot), getattr(b, slot), decimal)
-    else:
-        # Objects must be primitives
-
-        # Are they numbers?
-        if isinstance(a, (int, long, float, complex)):
-            numpy.testing.assert_almost_equal(a, b, decimal=decimal)
-        else:
-            assert a == b, "%s != %s" % (a, b)
-
-
 def get_job(cfg, username="openquake", hazard_calculation_id=None,
-            hazard_output_id=None):
+            hazard_output_id=None, **extras):
     """
     Given a path to a config file and a hazard_calculation_id
     (or, alternatively, a hazard_output_id, create a
     :class:`openquake.engine.db.models.OqJob` object for a risk calculation.
     """
     if hazard_calculation_id is None and hazard_output_id is None:
-        return engine.job_from_file(cfg, username, 'error', [])
+        return engine.job_from_file(cfg, username, 'error', [], **extras)
 
     job = engine.prepare_job(username)
-    params = engine.parse_config(open(cfg, 'r'))
+    oqparam = readini.parse_config(
+        open(cfg), hazard_calculation_id, hazard_output_id)
+    params = vars(oqparam)
+    if hazard_calculation_id is None:
+        params['hazard_calculation_id'] = models.Output.objects.get(
+            pk=hazard_output_id).oq_job.id
 
-    params.update(
-        dict(hazard_output_id=hazard_output_id,
-             hazard_calculation_id=hazard_calculation_id)
-    )
-
-    risk_calc = engine.create_calculation(
-        models.RiskCalculation, params)
+    # we are removing intensity_measure_types_and_levels because it is not
+    # a field of RiskCalculation; this ugliness will disappear when
+    # RiskCalculation will be removed
+    del params['intensity_measure_types_and_levels']
+    job.save_params(params)
+    risk_calc = engine.create_calculation(models.RiskCalculation, params)
     risk_calc = models.RiskCalculation.objects.get(id=risk_calc.id)
     job.risk_calculation = risk_calc
     job.save()
     return job
 
 
-def create_gmf(hazard_job, rlz=None):
+def create_gmf_sescoll(output, output_type='gmf'):
     """
-    Returns the created Gmf object.
-    """
-    hc = hazard_job.hazard_calculation
+    Returns Gmf and SESCollection instances.
 
-    rlz = rlz or models.LtRealization.objects.create(
-        hazard_calculation=hc, ordinal=0, seed=1, weight=None,
-        sm_lt_path="test_sm", gsim_lt_path="test_gsim")
+    :param output: a :class:`openquake.engine.db.models.Ouput` instance
+    :param output_type: a string with the output type
+    """
+    sescoll = models.SESCollection.create(output)
+
+    rlz = models.LtRealization.objects.create(
+        lt_model=sescoll.trt_model.lt_model, ordinal=0, weight=1,
+        gsim_lt_path="test_gsim")
 
     gmf = models.Gmf.objects.create(
         output=models.Output.objects.create_output(
-            hazard_job, "Test Hazard output", "gmf"),
+            output.oq_job, "Test Hazard output", output_type),
         lt_realization=rlz)
 
-    return gmf
+    return gmf, sescoll
 
 
-def create_gmf_data_records(hazard_job, rlz=None, ses_coll=None, points=None):
+def create_gmf_data_records(hazard_job, coordinates=None):
     """
     Returns the created records.
+
+    :param hazard_joint: a :class:`openquake.engine.db.models.OqJob` instance
+    :param coordinates: a list of (lon, lat) pairs
+
+    If the coordinates are not set, a list of 5 predefined locations is used
     """
-    gmf = create_gmf(hazard_job, rlz)
-    ses_coll = ses_coll or models.SESCollection.objects.create(
-        output=models.Output.objects.create_output(
-            hazard_job, "Test SES Collection", "ses"),
-        lt_realization_ids=[gmf.lt_realization.id],
-        ordinal=0)
+    output = models.Output.objects.create_output(
+        hazard_job, "Test SES Collection", "ses")
+    gmf, ses_coll = create_gmf_sescoll(output)
     ruptures = create_ses_ruptures(hazard_job, ses_coll, 3)
     records = []
-    if points is None:
-        points = [(15.310, 38.225), (15.71, 37.225),
-                  (15.48, 38.091), (15.565, 38.17),
-                  (15.481, 38.25)]
-    for site_id in hazard_job.hazard_calculation.save_sites(points):
+    if coordinates is None:
+        coordinates = [(15.310, 38.225), (15.71, 37.225),
+                       (15.48, 38.091), (15.565, 38.17),
+                       (15.481, 38.25)]
+    for site_id in models.save_sites(hazard_job, coordinates):
         records.append(models.GmfData.objects.create(
             gmf=gmf,
             task_no=0,
@@ -508,29 +389,28 @@ def create_gmf_data_records(hazard_job, rlz=None, ses_coll=None, points=None):
     return records
 
 
-# NB: create_gmf_from_csv and populate_gmf_data_from_csv
-# will be unified in the future
-def create_gmf_from_csv(job, fname):
+def create_gmf_from_csv(job, fname, output_type='gmf'):
     """
-    Populate the gmf_data table for an event_based calculation.
+    Populate the gmf_data table for an event_based (default)
+    or scenario calculation (output_type="gmf_scenario").
+
+    :param job: an :class:`openquake.engine.db.models.OqJob` instance
+    :param output_type: a string with the output type
     """
-    hc = job.hazard_calculation
-    hc.investigation_time = 50
-    hc.ses_per_logic_tree_path = 1
-    hc.save()
+    hc = job.get_oqparam()
+    if output_type == "gmf":  # event based
+        hc.investigation_time = 50
+        hc.ses_per_logic_tree_path = 1
 
     # tricks to fool the oqtask decorator
     job.is_running = True
     job.status = 'post_processing'
     job.save()
 
-    gmf = create_gmf(job)
+    output = models.Output.objects.create_output(
+        job, "Test SES Collection", "ses")
+    gmf, ses_coll = create_gmf_sescoll(output, output_type=output_type)
 
-    ses_coll = models.SESCollection.objects.create(
-        output=models.Output.objects.create_output(
-            job, "Test SES Collection", "ses"),
-        lt_realization_ids=[gmf.lt_realization.id],
-        ordinal=0)
     with open(fname, 'rb') as csvfile:
         gmfreader = csv.reader(csvfile, delimiter=',')
         locations = gmfreader.next()
@@ -542,45 +422,12 @@ def create_gmf_from_csv(job, fname):
 
         for i, gmvs in enumerate(gmv_matrix):
             point = tuple(map(float, locations[i].split()))
-            [site_id] = job.hazard_calculation.save_sites([point])
+            [site_id] = models.save_sites(job, [point])
             models.GmfData.objects.create(
                 gmf=gmf,
                 task_no=0,
                 imt="PGA", gmvs=gmvs,
                 rupture_ids=[r.id for r in ruptures],
-                site_id=site_id)
-
-    return gmf
-
-
-def populate_gmf_data_from_csv(job, fname):
-    """
-    Populate the gmf_data table for a scenario calculation.
-    """
-    # tricks to fool the oqtask decorator
-    job.is_running = True
-    job.status = 'post_processing'
-    job.save()
-
-    gmf = models.Gmf.objects.create(
-        output=models.Output.objects.create_output(
-            job, "Test Hazard output", "gmf_scenario"))
-
-    with open(fname, 'rb') as csvfile:
-        gmfreader = csv.reader(csvfile, delimiter=',')
-        locations = gmfreader.next()
-
-        gmv_matrix = numpy.array(
-            [map(float, row) for row in gmfreader]).transpose()
-
-        for i, gmvs in enumerate(gmv_matrix):
-            point = tuple(map(float, locations[i].split()))
-            [site_id] = job.hazard_calculation.save_sites([point])
-            models.GmfData.objects.create(
-                task_no=0,
-                imt="PGA",
-                gmf=gmf,
-                gmvs=gmvs,
                 site_id=site_id)
 
     return gmf
@@ -601,12 +448,15 @@ def get_fake_risk_job(risk_cfg, hazard_cfg, output_type="curve",
     """
 
     hazard_job = get_job(hazard_cfg, username)
-    hc = hazard_job.hazard_calculation
+    hc = hazard_job.get_oqparam()
+
+    lt_model = models.LtSourceModel.objects.create(
+        hazard_calculation=hazard_job,
+        ordinal=1, sm_lt_path="test_sm")
 
     rlz = models.LtRealization.objects.create(
-        hazard_calculation=hazard_job.hazard_calculation,
-        ordinal=1, seed=1, weight=None,
-        sm_lt_path="test_sm", gsim_lt_path="test_gsim")
+        lt_model=lt_model, ordinal=1, weight=1,
+        gsim_lt_path="test_gsim")
 
     if output_type == "curve":
         models.HazardCurve.objects.create(
@@ -624,6 +474,8 @@ def get_fake_risk_job(risk_cfg, hazard_cfg, output_type="curve",
 
         for point in ["POINT(-1.01 1.01)", "POINT(0.9 1.01)",
                       "POINT(0.01 0.01)", "POINT(0.9 0.9)"]:
+            models.HazardSite.objects.create(
+                hazard_calculation=hazard_job, location=point)
             models.HazardCurveData.objects.create(
                 hazard_curve=hazard_output,
                 poes=[0.1, 0.2, 0.3],
@@ -634,7 +486,11 @@ def get_fake_risk_job(risk_cfg, hazard_cfg, output_type="curve",
             output=models.Output.objects.create_output(
                 hazard_job, "Test gmf scenario output", "gmf_scenario"))
 
-        site_ids = hazard_job.hazard_calculation.save_sites(
+        models.SESCollection.create(
+            output=models.Output.objects.create_output(
+                hazard_job, "Test SES Collection", "ses"))
+        site_ids = models.save_sites(
+            hazard_job,
             [(15.48, 38.0900001), (15.565, 38.17), (15.481, 38.25)])
         for site_id in site_ids:
             models.GmfData.objects.create(
@@ -642,10 +498,11 @@ def get_fake_risk_job(risk_cfg, hazard_cfg, output_type="curve",
                 task_no=0,
                 imt="PGA",
                 site_id=site_id,
-                gmvs=[0.1, 0.2, 0.3])
+                gmvs=[0.1, 0.2, 0.3],
+                rupture_ids=[0, 1, 2])
 
     elif output_type in ("ses", "gmf"):
-        hazard_output = create_gmf_data_records(hazard_job, rlz)[0].gmf
+        hazard_output = create_gmf_data_records(hazard_job)[0].gmf
 
     else:
         raise RuntimeError('Unexpected output_type: %s' % output_type)
@@ -653,19 +510,23 @@ def get_fake_risk_job(risk_cfg, hazard_cfg, output_type="curve",
     hazard_job.status = "complete"
     hazard_job.save()
     job = engine.prepare_job(username)
-    params = engine.parse_config(open(risk_cfg, 'r'))
+    params = vars(
+        readini.parse_config(
+            open(risk_cfg), hazard_output_id=hazard_output.output.id))
+    params['hazard_calculation_id'] = hazard_job.id
 
-    params.update(dict(hazard_output_id=hazard_output.output.id))
-
+    # we are removing intensity_measure_types_and_levels because it is not
+    # a field of RiskCalculation; this ugliness will disappear when
+    # RiskCalculation will be removed
+    del params['intensity_measure_types_and_levels']
+    job.save_params(params)
     risk_calc = engine.create_calculation(models.RiskCalculation, params)
     job.risk_calculation = risk_calc
     job.save()
-    error_message = validate(job, 'risk', params, [])
 
     # reload risk calculation to have all the types converted properly
     job.risk_calculation = models.RiskCalculation.objects.get(id=risk_calc.id)
-    if error_message:
-        raise RuntimeError(error_message)
+
     return job, set(params['inputs'])
 
 
@@ -685,10 +546,6 @@ def create_ses_ruptures(job, ses_collection, num):
     Each rupture has a magnitude ranging from 0 to 10 and no geographic
     information.
     """
-    ses = models.SES.objects.create(
-        ses_collection=ses_collection,
-        investigation_time=job.hazard_calculation.investigation_time,
-        ordinal=1)
     rupture = ParametricProbabilisticRupture(
         mag=1 + 10. / float(num), rake=0,
         tectonic_region_type="test region type",
@@ -699,7 +556,10 @@ def create_ses_ruptures(job, ses_collection, num):
         occurrence_rate=1,
         temporal_occurrence_model=PoissonTOM(10),
         source_typology=object())
-    return [models.SESRupture.create(rupture, ses, 'test', i)
+    ses_ordinal = 1
+    seed = 42
+    pr = models.ProbabilisticRupture.create(rupture, ses_collection)
+    return [models.SESRupture.create(pr, ses_ordinal, 'test', 1, i, seed + i)
             for i in range(num)]
 
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -22,13 +22,13 @@ from openquake.risklib import workflows
 
 from openquake.engine.calculators.risk import (
     hazard_getters, writers, validation)
-from openquake.engine.calculators.risk.classical import core as classical
+from openquake.engine.calculators.risk.classical_risk import core as classical
 from openquake.engine.performance import EnginePerformanceMonitor
 from openquake.engine.utils import tasks
 
 
 @tasks.oqtask
-def classical_bcr(job_id, units, containers, _params):
+def classical_bcr(job_id, risk_model, getters, outputdict, _params):
     """
     Celery task for the BCR risk calculator based on the classical
     calculator.
@@ -38,9 +38,11 @@ def classical_bcr(job_id, units, containers, _params):
 
     :param int job_id:
       ID of the currently running job
-    :param list units:
-      A list of :class:`openquake.risklib.workflows.CalculationUnit`
-    :param containers:
+    :param risk_model:
+      A :class:`openquake.risklib.workflows.RiskModel` instance
+    :param getters:
+      A list of callable hazard getters
+    :param outputdict:
       An instance of :class:`..writers.OutputDict` containing
       output container instances (in this case only `BCRDistribution`)
     :param params:
@@ -53,22 +55,20 @@ def classical_bcr(job_id, units, containers, _params):
     # Do the job in other functions, such that it can be unit tested
     # without the celery machinery
     with transaction.commit_on_success(using='job_init'):
-        for unit in units:
-            do_classical_bcr(
-                unit,
-                containers.with_args(loss_type=unit.loss_type), monitor.copy)
+        do_classical_bcr(risk_model, getters, outputdict, monitor)
 
 
-def do_classical_bcr(unit, containers, profile):
-    outputs, _stats = unit(profile('getting hazard'), profile('computing bcr'))
-
-    with profile('writing results'):
-        for out in outputs:
-            containers.write(
-                unit.workflow.assets,
-                out.output,
-                output_type="bcr_distribution",
-                hazard_output_id=out.hid)
+def do_classical_bcr(risk_model, getters, outputdict, monitor):
+    out = risk_model.compute_outputs(getters, monitor.copy('getting hazard'))
+    for loss_type, outputs in out.iteritems():
+        outputdict = outputdict.with_args(loss_type=loss_type)
+        with monitor.copy('writing results'):
+            for out in outputs:
+                outputdict.write(
+                    risk_model.workflow.assets,
+                    out.output,
+                    output_type="bcr_distribution",
+                    hazard_output_id=out.hid)
 
 
 class ClassicalBCRRiskCalculator(classical.ClassicalRiskCalculator):
@@ -87,39 +87,16 @@ class ClassicalBCRRiskCalculator(classical.ClassicalRiskCalculator):
 
     output_builders = [writers.BCRMapBuilder]
 
-    def __init__(self, job):
-        super(ClassicalBCRRiskCalculator, self).__init__(job)
-        self.risk_models_retrofitted = None
+    getter_class = hazard_getters.HazardCurveGetter
 
-    def calculation_unit(self, loss_type, assets):
-        taxonomy = assets[0].taxonomy
-        model_orig = self.risk_models[taxonomy][loss_type]
-        model_retro = self.risk_models_retrofitted[taxonomy][loss_type]
+    bcr = True
 
-        return workflows.CalculationUnit(
-            loss_type,
-            workflows.ClassicalBCR(
-                model_orig.vulnerability_function,
-                model_retro.vulnerability_function,
-                self.rc.lrem_steps_per_interval,
-                self.rc.interest_rate,
-                self.rc.asset_life_expectancy),
-            hazard_getters.BCRGetter(
-                hazard_getters.HazardCurveGetterPerAsset(
-                    self.rc.hazard_outputs(),
-                    assets,
-                    self.rc.best_maximum_distance,
-                    model_orig.imt),
-                hazard_getters.HazardCurveGetterPerAsset(
-                    self.rc.hazard_outputs(),
-                    assets,
-                    self.rc.best_maximum_distance,
-                    model_retro.imt)))
-
-    def pre_execute(self):
+    def get_workflow(self, vf_orig, vf_retro):
         """
-        Store both the risk model for the original asset configuration
-        and the risk model for the retrofitted one.
+        Set the attributes .workflow and .getters
         """
-        super(ClassicalBCRRiskCalculator, self).pre_execute()
-        self.risk_models_retrofitted = self.get_risk_models(retrofitted=True)
+        return workflows.ClassicalBCR(
+            vf_orig, vf_retro,
+            self.rc.lrem_steps_per_interval,
+            self.rc.interest_rate,
+            self.rc.asset_life_expectancy)

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -16,40 +16,79 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
 
-
 """Utility functions related to splitting work into tasks."""
 
-import sys
-import traceback
-from functools import wraps
-
-from celery.task.sets import TaskSet
+from celery.result import ResultSet
+from celery.app import current_app
 from celery.task import task
 
-from openquake.engine import logs, no_distribute
+from openquake.commonlib.general import split_in_blocks
+from openquake.commonlib.parallel import \
+    TaskManager, safely_call, check_mem_usage, pickle_sequence, no_distribute
+from openquake.engine import logs
 from openquake.engine.db import models
 from openquake.engine.utils import config
 from openquake.engine.writer import CacheInserter
 from openquake.engine.performance import EnginePerformanceMonitor
 
+CONCURRENT_TASKS = int(config.get('celery', 'concurrent_tasks'))
 
-def safely_call(func, args):
+
+class JobNotRunning(Exception):
+    pass
+
+
+class OqTaskManager(TaskManager):
     """
-    Call the given function with the given arguments safely, i.e.
-    by trapping the exceptions. Return a pair (result, exc_type)
-    where exc_type is None if no exceptions occur, otherwise it
-    is the exception class and the result is a string containing
-    error message and traceback.
+    A celery-based task manager. The usage is::
+
+      oqm = OqTaskManager(do_something, logs.LOG.progress)
+      oqm.send(arg1, arg2)
+      oqm.send(arg3, arg4)
+      print oqm.aggregate_results(agg, acc)
+
+    Progress report is built-in.
     """
-    try:
-        return func(*args), None
-    except:
-        etype, exc, tb = sys.exc_info()
-        tb_str = ''.join(traceback.format_tb(tb))
-        return '%s\n%s' % (exc, tb_str), etype
+    def submit(self, *args):
+        """
+        Submit an oqtask with the given arguments to celery and return
+        an AsyncResult. If the variable OQ_NO_DISTRIBUTE is set, the
+        task function is run in process and the result is returned.
+        """
+        check_mem_usage()  # log a warning if too much memory is used
+        if no_distribute():
+            res = safely_call(self.oqtask.task_func, args)
+        else:
+            piks = pickle_sequence(args)
+            self.sent += sum(len(p) for p in piks)
+            res = self.oqtask.delay(*piks)
+        self.results.append(res)
+
+    def aggregate_result_set(self, agg, acc):
+        """
+        Loop on a set of celery AsyncResults and update the accumulator
+        by using the aggregation function.
+
+        :param agg: the aggregation function, (acc, val) -> new acc
+        :param acc: the initial value of the accumulator
+        :returns: the final value of the accumulator
+        """
+        if not self.results:
+            return acc
+        backend = current_app().backend
+        rset = ResultSet(self.results)
+        for task_id, result_dict in rset.iter_native():
+            check_mem_usage()  # log a warning if too much memory is used
+            result = result_dict['result']
+            if isinstance(result, BaseException):
+                raise result
+            self.received += len(result)
+            acc = agg(acc, result.unpickle())
+            del backend._cache[task_id]  # work around a celery bug
+        return acc
 
 
-def map_reduce(task, task_args, agg, acc):
+def map_reduce(task, task_args, agg, acc, name=None):
     """
     Given a task and an iterable of positional arguments, apply the
     task function to the arguments in parallel and return an aggregate
@@ -57,12 +96,6 @@ def map_reduce(task, task_args, agg, acc):
     and on the aggregation function. To save memory, the order is
     not preserved and there is no list with the intermediated results:
     the accumulator is incremented as soon as a task result comes.
-
-    :param task: a `celery` task callable.
-    :param task_args: an iterable over positional arguments
-    :param agg: the aggregation function, (acc, val) -> new acc
-    :param acc: the initial value of the accumulator
-    :returns: the final value of the accumulator
 
     NB: if the environment variable OQ_NO_DISTRIBUTE is set the
     tasks are run sequentially in the current process and then
@@ -73,20 +106,47 @@ def map_reduce(task, task_args, agg, acc):
     or large results are returned they may incur in memory issue:
     this is way the calculators limit the queue with the
     `concurrent_task` concept.
+
+    :param task: a `celery` task callable.
+    :param task_args: an iterable over positional arguments
+    :param agg: the aggregation function, (acc, val) -> new acc
+    :param acc: the initial value of the accumulator
+    :returns: the final value of the accumulator
     """
-    if no_distribute():
-        for the_args in task_args:
-            result, exctype = safely_call(task.task_func, the_args)
-            if exctype:
-                raise exctype(result)
-            acc = agg(acc, result)
-    else:
-        taskset = TaskSet(tasks=map(task.subtask, task_args))
-        for result, exctype in taskset.apply_async():
-            if exctype:
-                raise exctype(result)
-            acc = agg(acc, result)
-    return acc
+    oqm = OqTaskManager(task, logs.LOG.progress, name)
+    for args in task_args:
+        oqm.submit(*args)
+    return oqm.aggregate_results(agg, acc)
+
+
+def apply_reduce(task, task_args,
+                 agg=lambda a, x: x, acc=None,
+                 concurrent_tasks=CONCURRENT_TASKS,
+                 weight=lambda item: 1,
+                 key=lambda item: 'Unspecified'):
+    """
+    Apply a task to a tuple of the form (job_id, data, *args)
+    by splitting the data in chunks and reduce the results with an
+    aggregation function.
+
+    :param task: an oqtask
+    :param task_args: the arguments to be passed to the task function
+    :param agg: the aggregation function
+    :param acc: initial value of the accumulator
+    :param concurrent_tasks: hint about how many tasks to generate
+    :param weight: function to extract the weight of an item in data
+    :param key: function to extract the kind of an item in data
+    """
+    job_id = task_args[0]
+    data = task_args[1]
+    args = task_args[2:]
+    if not data:
+        return acc
+    elif len(data) == 1 or not concurrent_tasks:
+        return agg(acc, task.task_func(job_id, data, *args))
+    blocks = split_in_blocks(data, concurrent_tasks, weight, key)
+    alldata = [(job_id, block) + args for block in blocks]
+    return map_reduce(task, alldata, agg, acc)
 
 
 # used to implement BaseCalculator.parallelize, which takes in account
@@ -99,12 +159,12 @@ def parallelize(task, task_args, side_effect=lambda val: None):
     callable and does something with it (such as saving or printing
     it). Notice that the order is not preserved. parallelize returns None.
 
+    NB: if the environment variable OQ_NO_DISTRIBUTE is set the
+    tasks are run sequentially in the current process.
+
     :param task: a celery task
     :param task_args: an iterable over positional arguments
     :param side_effect: a function val -> None
-
-    NB: if the environment variable OQ_NO_DISTRIBUTE is set the
-    tasks are run sequentially in the current process.
     """
     map_reduce(task, task_args, lambda acc, val: side_effect(val), None)
 
@@ -115,9 +175,9 @@ def oqtask(task_func):
     errors which occur inside the task. Also checks to make sure the job is
     actually still running. If it is not running, the task doesn't get
     executed, so we don't do useless computation.
-    """
 
-    @wraps(task_func)
+    :param task_func: the function to decorate
+    """
     def wrapped(*args):
         """
         Initialize logs, make sure the job is still running, and run the task
@@ -129,7 +189,7 @@ def oqtask(task_func):
         job = models.OqJob.objects.get(id=job_id)
         if job.is_running is False:
             # the job was killed, it is useless to run the task
-            return None, None
+            raise JobNotRunning(job_id)
 
         # it is important to save the task id soon, so that
         # the revoke functionality can work
@@ -139,9 +199,10 @@ def oqtask(task_func):
                 'total ' + task_func.__name__, job_id, tsk, flush=True):
             # tasks write on the celery log file
             logs.set_level(job.log_level)
+            check_mem_usage()  # log a warning if too much memory is used
             try:
                 # run the task
-                return safely_call(task_func, args)
+                return task_func(*args)
             finally:
                 # save on the db
                 CacheInserter.flushall()
@@ -151,7 +212,14 @@ def oqtask(task_func):
                     oq_job=job,
                     operation='storing task id',
                     task_id=tsk.request.id).delete()
+<<<<<<< HEAD
     celery_queue = config.get('redis', 'celery_queue')
     tsk = task(wrapped, queue=celery_queue)
+=======
+    celery_queue = config.get('amqp', 'celery_queue')
+    f = lambda *args: safely_call(wrapped, args, pickle=True)
+    f.__name__ = task_func.__name__
+    tsk = task(f, queue=celery_queue)
+>>>>>>> master
     tsk.task_func = task_func
     return tsk

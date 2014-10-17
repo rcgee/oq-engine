@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2013, GEM Foundation.
+# Copyright (c) 2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -23,22 +23,29 @@ import mock
 from openquake.engine.calculators.risk import validation
 from openquake.engine.db import models
 
+from openquake.risklib.workflows import RiskModel
+
 
 class HazardIMTTestCase(unittest.TestCase):
     def test_get_error(self):
+        vf1 = mock.Mock()
+        vf1.imt = 'PGA'
+        vf2 = mock.Mock()
+        vf2.imt = 'PGV'
         calc = mock.Mock()
+        workflow = mock.Mock()
+        workflow.vulnerability_functions = dict(
+            structural=vf1, nonstructural=vf2)
         calc.risk_models = {
-            'tax1': {
-                'loss1': models.RiskModel('imt1', None, None)},
-            'tax2': {
-                'loss2': models.RiskModel('imt2', None, None)}}
-        calc.hc.get_imts = mock.Mock(return_value=['imt1', 'imt2'])
+            ('PGA', 'tax1'): RiskModel('PGA', 'tax1', workflow),
+            ('PGV', 'tax2'): RiskModel('PGV', 'tax2', workflow)}
+        calc.rc.get_hazard_param().intensity_measure_types = ['PGA', 'PGV']
         val = validation.HazardIMT(calc)
 
         self.assertIsNone(val.get_error())
-        calc.hc.get_imts = mock.Mock(return_value=['imt1'])
-        self.assertEqual(("There is no hazard output for: imt2. "
-                          "The available IMTs are: imt1."), val.get_error())
+        calc.rc.get_hazard_param().intensity_measure_types = ['PGA']
+        self.assertEqual(("There is no hazard output for: PGV. "
+                          "The available IMTs are: PGA."), val.get_error())
 
 
 class EmptyExposureTestCase(unittest.TestCase):
@@ -63,7 +70,7 @@ class OrphanTaxonomiesTestCase(unittest.TestCase):
         val = validation.OrphanTaxonomies(calc)
 
         calc.rc.taxonomies_from_model = True
-        calc.risk_models = {'RM': mock.Mock()}
+        calc.risk_models = {('PGA', 'RM'): mock.Mock()}
         calc.taxonomies_asset_count = {'RC': 1, 'RM': 2}
 
         self.assertIsNone(val.get_error())
@@ -73,7 +80,8 @@ class OrphanTaxonomiesTestCase(unittest.TestCase):
                          "but not in the risk model: set(['RC'])",
                          val.get_error())
 
-        calc.risk_models = {'RM': mock.Mock(), 'RC': mock.Mock()}
+        calc.risk_models = {('PGA', 'RM'): mock.Mock(),
+                            ('PGA', 'RC'): mock.Mock()}
         self.assertIsNone(val.get_error())
 
 
@@ -82,13 +90,14 @@ class ExposureLossTypesTestCase(unittest.TestCase):
         calc = mock.Mock()
         val = validation.ExposureLossTypes(calc)
 
-        calc.risk_models = {'RM': {'loss_type': mock.Mock()}}
+        calc.loss_types = models.LOSS_TYPES
+        calc.risk_models = {'RM': mock.Mock()}
 
         calc.rc.exposure_model.supports_loss_type = mock.Mock(
             return_value=False)
 
         self.assertEqual(("Invalid exposure "
-                          "for computing loss type loss_type. "),
+                          "for computing loss type structural. "),
                          val.get_error())
 
         calc.rc.exposure_model.supports_loss_type = mock.Mock(
@@ -115,19 +124,22 @@ class RequireClassicalHazardTestCase(unittest.TestCase):
         calc = mock.Mock()
 
         val = validation.RequireClassicalHazard(calc)
+        output = mock.Mock()
+        calc.rc.hazard_outputs.return_value = [output]
 
-        calc.rc.hazard_calculation.calculation_mode = 'classical'
+        calc.rc.get_hazard_param().calculation_mode = 'classical'
         self.assertIsNone(val.get_error())
 
-        calc.rc.hazard_calculation.calculation_mode = 'event_based'
+        calc.rc.get_hazard_param().calculation_mode = 'event_based'
         self.assertEqual(("The provided hazard calculation ID "
                           "is not a classical calculation"), val.get_error())
 
-        calc.rc.hazard_calculation = None
-        calc.rc.hazard_output.is_hazard_curve = mock.Mock(return_value=True)
+        calc.rc.get_hazard_param().calculation_mode = 'classical'
+
+        output.is_hazard_curve = mock.Mock(return_value=True)
         self.assertIsNone(val.get_error())
 
-        calc.rc.hazard_output.is_hazard_curve = mock.Mock(return_value=False)
+        output.is_hazard_curve = mock.Mock(return_value=False)
         self.assertEqual("The provided hazard output is not an hazard curve",
                          val.get_error())
 
@@ -137,19 +149,22 @@ class RequireScenarioHazardTestCase(unittest.TestCase):
         calc = mock.Mock()
 
         val = validation.RequireScenarioHazard(calc)
+        output = mock.Mock()
+        calc.rc.hazard_outputs.return_value = [output]
 
-        calc.rc.hazard_calculation.calculation_mode = 'scenario'
+        calc.rc.get_hazard_param().calculation_mode = 'scenario'
+        output.output_type = "gmf_scenario"
         self.assertIsNone(val.get_error())
 
-        calc.rc.hazard_calculation.calculation_mode = 'event_based'
+        calc.rc.get_hazard_param().calculation_mode = 'event_based'
         self.assertEqual(("The provided hazard calculation ID "
                           "is not a scenario calculation"), val.get_error())
 
-        calc.rc.hazard_calculation = None
-        calc.rc.hazard_output.output_type = "gmf_scenario"
+        calc.rc.get_hazard_param().calculation_mode = 'scenario'
+        output.output_type = "gmf_scenario"
         self.assertIsNone(val.get_error())
 
-        calc.rc.hazard_output.output_type = "gmf"
+        output.output_type = "gmf"
         self.assertEqual(("The provided hazard is not a "
                           "gmf scenario collection"),
                          val.get_error())
@@ -165,27 +180,31 @@ class RequireEventBasedHazardTestCase(unittest.TestCase):
 
         val = validation.RequireEventBasedHazard(calc)
 
-        calc.rc.hazard_calculation.calculation_mode = 'event_based'
+        calc.rc.get_hazard_param().calculation_mode = 'event_based'
+        # here calc.rc.inputs is a Mock object and therefore
+        # hc.gsim_logic_tree_file is a not None Mock object;
+        # no validation error should be raised
         self.assertIsNone(val.get_error())
 
         output.output_type = "ses"
-        calc.rc.inputs = {}
-        self.assertIsNotNone(val.get_error())
+        calc.rc.inputs = {}  # hence no gsim_logic_tree_file
+        self.assertEqual(
+            val.get_error(), 'gsim_logic_tree_file is mandatory when the '
+            'hazard output is a ses collection')
 
-        calc.rc.inputs = {'source_model_logic_tree': None}
-        self.assertIsNone(val.get_error())
-
-        calc.rc.hazard_calculation.calculation_mode = 'classical'
+        calc.rc.get_hazard_param().calculation_mode = 'classical'
         self.assertEqual(("The provided hazard calculation ID "
                           "is not a event based calculation"), val.get_error())
 
-        calc.rc.hazard_calculation = None
-        calc.rc.hazard_output.output_type = "gmf"
-        self.assertIsNone(val.get_error())
+        calc.rc.get_hazard_param().calculation_mode = 'event_based'
         calc.rc.hazard_output.output_type = "ses"
-        self.assertIsNone(val.get_error())
+        # we must get an error because there is no gsim_logic_tree_file
+        self.assertEqual(
+            val.get_error(), 'gsim_logic_tree_file is mandatory when the '
+            'hazard output is a ses collection')
 
-        calc.rc.hazard_output.output_type = "gmf_scenario"
+        calc.rc.inputs = {'gsim_logic_tree': mock.Mock()}
+        output.output_type = "gmf_scenario"
         self.assertEqual(("The provided hazard is not a "
                           "gmf or ses collection"),
                          val.get_error())

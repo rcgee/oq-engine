@@ -1,4 +1,4 @@
-import functools
+import zipfile
 import StringIO
 import json
 import logging
@@ -6,8 +6,6 @@ import os
 import shutil
 import tempfile
 import urlparse
-import sys
-import traceback
 
 from xml.etree import ElementTree as etree
 
@@ -17,12 +15,12 @@ from django.http import HttpResponseNotFound
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from openquake import nrmllib
+from openquake.commonlib import nrml
 from openquake.engine import engine as oq_engine
 from openquake.engine.db import models as oqe_models
 from openquake.engine.export import hazard as hazard_export
 from openquake.engine.export import risk as risk_export
-
+from openquake.engine.utils.tasks import safely_call
 from openquake.server import tasks, executor
 
 METHOD_NOT_ALLOWED = 405
@@ -30,7 +28,7 @@ NOT_IMPLEMENTED = 501
 JSON = 'application/json'
 
 IGNORE_FIELDS = ('base_path', 'export_dir')
-GEOM_FIELDS = ('region', 'sites', 'region_constraint', 'sites_disagg')
+GEOM_FIELDS = ('region', 'region_constraint')
 RISK_INPUTS = ('hazard_calculation', 'hazard_output')
 
 DEFAULT_LOG_LEVEL = 'progress'
@@ -86,6 +84,8 @@ def _calc_to_response_data(calc):
     """
     Extract the calculation parameters into a dictionary.
     """
+    if isinstance(calc, oqe_models.OqJob):
+        return vars(calc.get_oqparam())
     fields = [x.name for x in calc._meta.fields if x.name not in IGNORE_FIELDS]
     response_data = {}
     for field_name in fields:
@@ -118,7 +118,7 @@ def create_detect_job_file(*candidates):
     return detect_job_file
 
 
-def _prepare_job(request, hazard_output_id, hazard_calculation_id,
+def _prepare_job(request, hazard_output_id, hazard_job_id,
                  detect_job_file):
     """
     Creates a temporary directory, move uploaded files there and
@@ -128,22 +128,23 @@ def _prepare_job(request, hazard_output_id, hazard_calculation_id,
     :returns: job_file and temp_dir
     """
     temp_dir = tempfile.mkdtemp()
-
-    if len(request.FILES.getlist('job_config')) > 1:
-        raw_files = request.FILES.getlist('job_config')
-    else:
-        raw_files = request.FILES.values()
-
-    # Move each file to a new temp dir, using the upload file names
-    # (not the temporary ones)
     files = []
-    for each_file in raw_files:
-        new_path = os.path.join(temp_dir, each_file.name)
-        shutil.move(each_file.temporary_file_path(), new_path)
-        files.append(new_path)
 
+    try:
+        archive = zipfile.ZipFile(request.FILES['archive'])
+    except KeyError:
+        # move each file to a new temp dir, using the upload file names,
+        # not the temporary ones
+        for each_file in request.FILES.values():
+            new_path = os.path.join(temp_dir, each_file.name)
+            shutil.move(each_file.temporary_file_path(), new_path)
+            files.append(new_path)
+    else:  # extract the files from the archive into temp_dir
+        archive.extractall(temp_dir)
+        archive.close()
+        for fname in os.listdir(temp_dir):
+            files.append(os.path.join(temp_dir, fname))
     job_file = detect_job_file([f for f in files if f.endswith('.ini')])
-
     return job_file, temp_dir
 
 
@@ -157,11 +158,11 @@ def _is_source_model(tempfile):
     _, nrml_elem = tree.next()
     _, model_elem = tree.next()
 
-    assert nrml_elem.tag == '{%s}nrml' % nrmllib.NAMESPACE, (
+    assert nrml_elem.tag == '{%s}nrml' % nrml.NAMESPACE, (
         "Input file is not a NRML artifact"
     )
 
-    if model_elem.tag == '{%s}sourceModel' % nrmllib.NAMESPACE:
+    if model_elem.tag == '{%s}sourceModel' % nrml.NAMESPACE:
         return True
     return False
 
@@ -186,13 +187,10 @@ def calc_info(request, job_type, calc_id):
 # oq-engine DB, as a dictionary
 def _get_calc_info(job_type, calc_id):
     if job_type == 'hazard':
-        job = oqe_models.OqJob.objects\
-            .select_related()\
-            .get(hazard_calculation=calc_id)
-        calc = job.hazard_calculation
+        job = oqe_models.OqJob.objects.select_related().get(pk=calc_id)
+        calc = job
     else:  # risk
-        job = oqe_models.OqJob.objects\
-            .select_related()\
+        job = oqe_models.OqJob.objects.select_related()\
             .get(risk_calculation=calc_id)
         calc = job.risk_calculation
 
@@ -243,17 +241,26 @@ def run_calc(request, job_type):
     foreign_calc_id = request.POST.get('foreign_calculation_id')
 
     hazard_output_id = request.POST.get('hazard_output_id')
-    hazard_calculation_id = request.POST.get('hazard_calculation_id')
+    hazard_job_id = request.POST.get('hazard_job_id')
 
-    job_file, temp_dir = _prepare_job(
-        request, hazard_output_id, hazard_calculation_id,
-        create_detect_job_file("job.ini", "job_risk.ini"))
-
+    is_risk = hazard_output_id or hazard_job_id
+    if is_risk:
+        detect_job_file = create_detect_job_file("job_risk.ini", "job.ini")
+    else:
+        detect_job_file = create_detect_job_file("job_hazard.ini", "job.ini")
+    einfo, exctype = safely_call(
+        _prepare_job, (request, hazard_output_id, hazard_job_id,
+                       detect_job_file))
+    if exctype:
+        tasks.update_calculation(callback_url, status="failed", einfo=einfo)
+        raise exctype(einfo)
+    else:
+        job_file, temp_dir = einfo
     job, _fut = submit_job(job_file, temp_dir, request.POST['database'],
                            callback_url, foreign_calc_id,
-                           hazard_output_id, hazard_calculation_id)
+                           hazard_output_id, hazard_job_id)
     try:
-        response_data = _get_calc_info(job_type, job.calculation.id)
+        response_data = _get_calc_info(job_type, job.calc_id)
     except ObjectDoesNotExist:
         return HttpResponseNotFound()
 
@@ -262,27 +269,21 @@ def run_calc(request, job_type):
 
 def submit_job(job_file, temp_dir, dbname,
                callback_url=None, foreign_calc_id=None,
-               hazard_output_id=None, hazard_calculation_id=None,
+               hazard_output_id=None, hazard_job_id=None,
                logfile=None):
     """
     Create a job object from the given job.ini file in the job directory
     and submit it to the job queue.
     """
-    try:
-        job = oq_engine.job_from_file(
-            job_file, "platform", DEFAULT_LOG_LEVEL, [], hazard_output_id,
-            hazard_calculation_id)
-    except:  # catch errors in the job creation phase
-        etype, exc, tb = sys.exc_info()
-        einfo = "".join(traceback.format_tb(tb))
-        einfo += '%s: %s' % (etype.__name__, exc)
-        tasks.update_calculation(callback_url, status="failed", einfo=einfo)
-        raise
+    job, exctype = safely_call(
+        oq_engine.job_from_file, (job_file, "platform", DEFAULT_LOG_LEVEL, [],
+                                  hazard_output_id, hazard_job_id))
+    if exctype:
+        tasks.update_calculation(callback_url, status="failed", einfo=job)
+        raise exctype(job)
 
-    calc = job.calculation
-    job_type = 'risk' if job.calculation is job.risk_calculation else 'hazard'
     future = executor.submit(
-        tasks.run_calc, job_type, calc.id, temp_dir,
+        tasks.safely_call, tasks.run_calc, job.job_type, job.id, temp_dir,
         callback_url, foreign_calc_id, dbname, logfile)
     return job, future
 
@@ -293,20 +294,14 @@ def _get_calcs(job_type):
 
     Gets all calculation records available.
     """
+    job_params = oqe_models.JobParam.objects.filter(
+        name='description', job__risk_calculation__isnull=job_type == 'hazard',
+        job__user_name='platform')
     if job_type == 'risk':
-        return oqe_models.OqJob.objects\
-            .select_related()\
-            .filter(risk_calculation__isnull=False)\
-            .values_list('risk_calculation',
-                         'status',
-                         'risk_calculation__description')
-    else:
-        return oqe_models.OqJob.objects\
-            .select_related()\
-            .filter(hazard_calculation__isnull=False)\
-            .values_list('hazard_calculation',
-                         'status',
-                         'hazard_calculation__description')
+        return [(jp.job.risk_calculation, jp.job.status, jp.value)
+                for jp in job_params]
+    else:  # hazard
+        return [(jp.job, jp.job.status, jp.value) for jp in job_params]
 
 
 @require_http_methods(['GET'])
@@ -321,17 +316,17 @@ def calc_results(request, job_type, calc_id):
         * type (hazard_curve, hazard_map, etc.)
         * url (the exact url where the full result can be accessed)
     """
-    calc_class = oqe_models.RiskCalculation if job_type == 'risk' \
-        else oqe_models.HazardCalculation
     # If the specified calculation doesn't exist OR is not yet complete,
     # throw back a 404.
     try:
-        calc = calc_class.objects.get(id=calc_id)
-        if not calc.oqjob.status == 'complete':
+        if job_type == 'risk':
+            oqjob = oqe_models.RiskCalculation.objects.get(id=calc_id).oqjob
+        else:
+            oqjob = oqe_models.OqJob.objects.get(id=calc_id)
+        if not oqjob.status == 'complete':
             return HttpResponseNotFound()
     except ObjectDoesNotExist:
         return HttpResponseNotFound()
-
     base_url = _get_base_url(request)
 
     results = oq_engine.get_outputs(job_type, calc_id)

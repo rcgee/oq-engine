@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -29,20 +29,22 @@ class ScenarioRiskCase2TestCase(risk.BaseRiskQATestCase):
 
     def get_hazard_job(self):
         job = helpers.get_job(
-            helpers.get_data_path("scenario_hazard/job.ini"))
+            helpers.get_data_path("scenario_hazard/job.ini"),
+            number_of_ground_motion_fields=1000)
         fname = self._test_path('gmf_scenario.csv')
-        helpers.populate_gmf_data_from_csv(job, fname)
+        helpers.create_gmf_from_csv(job, fname, 'gmf_scenario')
         return job
 
     def actual_data(self, job):
         maps = models.LossMapData.objects.filter(
             loss_map__output__oq_job=job).order_by('asset_ref', 'value')
         agg = models.AggregateLoss.objects.get(output__oq_job=job)
-        return [[[m.value, m.std_dev] for m in maps],
+        data = [[[m.value, m.std_dev] for m in maps],
                 [agg.mean, agg.std_dev]]
+        return data
 
     def expected_data(self):
-        return [[[522.40316578, 249.26357273],
-                 [512.3892894, 347.75665613],
-                 [200.21969199, 95.12689831]],
-                [1235.01214717, 503.25181506]]
+        return [[[523.06275339, 248.83131322],
+                 [500.83619571, 324.42264285],
+                 [200.3348642,  96.17884412]],
+                [1224.23381329, 478.73144303]]

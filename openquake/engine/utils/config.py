@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -25,9 +25,9 @@ import ConfigParser
 import os
 import pwd
 import sys
+from contextlib import contextmanager
 
 import openquake.engine
-from openquake.engine.utils import general
 
 OQDIR = os.path.dirname(os.path.dirname(openquake.engine.__path__[0]))
 #: Environment variable name for specifying a custom openquake.cfg.
@@ -35,8 +35,8 @@ OQDIR = os.path.dirname(os.path.dirname(openquake.engine.__path__[0]))
 OQ_CONFIG_FILE_VAR = "OQ_CONFIG_FILE"
 
 
-@general.singleton
-class Config(object):
+# singleton
+class _Config(object):
     """
     Load the configuration, make each section available in a separate
     dict.
@@ -64,6 +64,10 @@ class Config(object):
     def get(self, name):
         """A dict with key/value pairs for the given `section` or `None`."""
         return self.cfg.get(name)
+
+    def set(self, name, dic):
+        """Set the dictionary for given section"""
+        self.cfg[name] = dic
 
     def _get_paths(self):
         """Return the paths for the global/local configuration files."""
@@ -98,9 +102,27 @@ class Config(object):
         return any(os.path.exists(path) for path in self._get_paths())
 
 
+cfg = _Config()  # the only instance of _Config
+
+
+@contextmanager
+def context(section, **kw):
+    """
+    Context manager used to change the parameters of a configuration
+    section on the fly. For use in the tests.
+    """
+    section_dict = cfg.get(section)
+    orig = section_dict.copy()
+    try:
+        section_dict.update(kw)
+        yield
+    finally:
+        cfg.set(section, orig)
+
+
 def get_section(section):
     """A dictionary of key/value pairs for the given `section` or `None`."""
-    return Config().get(section)
+    return cfg.get(section)
 
 
 def get(section, key):
@@ -111,14 +133,13 @@ def get(section, key):
 
 def abort_if_no_config_available():
     """Call sys.exit() if no openquake configuration file is readable."""
-    conf = Config()
-    if not conf.exists():
+    if not cfg.exists():
         msg = ('Could not find a configuration file in %s. '
                'Probably your are not in the right directory'
-               % conf._get_paths())
+               % cfg._get_paths())
         print msg
         sys.exit(2)
-    if not conf.is_readable():
+    if not cfg.is_readable():
         msg = (
             "\nYou are not authorized to read any of the OpenQuake "
             "configuration files.\n"
@@ -141,7 +162,7 @@ def flag_set(section, setting):
     setting = get(section, setting)
     if setting is None:
         return False
-    return general.str2bool(setting)
+    return setting.lower() in ("true", "yes", "t", "1")
 
 
 def refresh():
@@ -151,4 +172,4 @@ def refresh():
     NOTE: Use with caution. Calling this during some phases of a calculation
     could cause undesirable side-effects.
     """
-    Config()._load_from_file()
+    cfg._load_from_file()

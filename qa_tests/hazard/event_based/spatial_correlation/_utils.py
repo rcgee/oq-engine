@@ -1,4 +1,4 @@
-# Copyright (c) 2013, GEM Foundation.
+# Copyright (c) 2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -50,6 +50,10 @@ def joint_prob_of_occurrence(gmvs_site_1, gmvs_site_2, gmv, time_span,
     return prob
 
 
+# it is important to return the gmvs in a consistent order to be able to
+# compare different locations; in other words, the gmvs must correspond to
+# the same ruptures in all locations; this is why I am ordering by
+# rupture_id; this is used only in the tests (MS)
 def get_gmvs_for_location(location, job):
     """
     Get a list of GMVs (as floats) for a given ``location`` and ``job_id``.
@@ -59,15 +63,15 @@ def get_gmvs_for_location(location, job):
     :param job:
         The job that generated the GMVs
     :returns:
-        `list` of ground motion values, as floats
+        `list` of ground motion values, as floats, sorted by rupture_id
     """
     [output] = job.output_set.filter(output_type='gmf')
 
-    [site] = models.HazardSite.objects.filter(
-        hazard_calculation=job.hazard_calculation).extra(
+    [site] = models.HazardSite.objects.filter(hazard_calculation=job).extra(
         where=["location::geometry ~= 'SRID=4326;%s'::geometry"
                % location])
-    gmvs = []
+    gmv_by_rup = {}
     for gmf in models.GmfData.objects.filter(site=site, gmf=output.gmf):
-        gmvs.extend(gmf.gmvs)
-    return gmvs
+        gmv_by_rup.update(zip(gmf.rupture_ids, gmf.gmvs))
+
+    return [gmv_by_rup[r] for r in sorted(gmv_by_rup)]

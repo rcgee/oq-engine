@@ -1,7 +1,7 @@
 #  -*- coding: utf-8 -*-
 #  vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-#  Copyright (c) 2010-2013, GEM foundation
+#  Copyright (c) 2010-2014, GEM Foundation
 
 #  OpenQuake is free software: you can redistribute it and/or modify it
 #  under the terms of the GNU Affero General Public License as published
@@ -24,25 +24,27 @@ import numpy
 
 from django import db
 
-from openquake.risklib import workflows, calculators
+from openquake.commonlib.riskmodels import get_risk_models
 
 from openquake.engine.calculators.risk import (
-    base, hazard_getters, writers, validation, loaders)
+    base, hazard_getters, writers, validation)
 from openquake.engine.performance import EnginePerformanceMonitor
 from openquake.engine.utils import tasks
 from openquake.engine.db import models
-from openquake.engine import logs
 
 
 @tasks.oqtask
-def scenario_damage(job_id, units, containers, params):
+def scenario_damage(job_id, risk_model, getters, outputdict, params):
     """
     Celery task for the scenario damage risk calculator.
 
     :param int job_id:
       ID of the currently running job
-    :param list units:
-    :param containers:
+    :param risk_model:
+      A :class:`openquake.risklib.workflows.RiskModel` instance
+    :param getters:
+      A list of callable hazard getters
+    :param outputdict:
       An instance of :class:`..writers.OutputDict` containing
       output container instances (in this case only `LossMap`)
     :param params:
@@ -53,42 +55,27 @@ def scenario_damage(job_id, units, containers, params):
     """
     monitor = EnginePerformanceMonitor(
         None, job_id, scenario_damage, tracing=True)
-
-    # in scenario damage calculation we have only ONE calculation unit
-    [unit] = units
+    # in scenario damage calculation the only loss_type is 'damage'
+    [getter] = getters
+    [ffs] = risk_model.vulnerability_functions
 
     # and NO containes
-    assert len(containers) == 0
-
+    assert len(outputdict) == 0
     with db.transaction.commit_on_success(using='job_init'):
-        return do_scenario_damage(unit, params, monitor.copy)
 
+        with monitor.copy('getting hazard'):
+            ground_motion_values = getter.get_data(ffs.imt)
 
-def do_scenario_damage(unit, params, profile):
-    with profile('getting hazard'):
-        _hid, assets, ground_motion_values = unit.getter().next()
+        with monitor.copy('computing risk'):
+            fractions = risk_model.workflow(ground_motion_values)
+            aggfractions = sum(fractions[i] * asset.number_of_units
+                               for i, asset in enumerate(getter.assets))
 
-    if not len(assets):
-        logs.LOG.warn("Exit from task as no asset could be processed")
-        return None, None
+        with monitor.copy('saving damage per assets'):
+            writers.damage_distribution(
+                getter.assets, fractions, params.damage_state_ids)
 
-    elif not len(ground_motion_values):
-        # NB: (MS) this should not happen, but I saw it happens;
-        # should it happen again, to debug this situation you should run
-        # the query in GroundMotionValuesGetter.assets_gen and see
-        # how it is possible that sites without gmvs are returned
-        raise RuntimeError("No GMVs for assets %s" % assets)
-
-    with profile('computing risk'):
-        fraction_matrix = unit.workflow(ground_motion_values)
-        aggfractions = sum(fraction_matrix[i] * asset.number_of_units
-                           for i, asset in enumerate(assets))
-
-    with profile('saving damage per assets'):
-        writers.damage_distribution(
-            assets, fraction_matrix, params.damage_state_ids)
-
-    return aggfractions, assets[0].taxonomy
+        return {risk_model.taxonomy: aggfractions}
 
 
 class ScenarioDamageRiskCalculator(base.RiskCalculator):
@@ -112,52 +99,33 @@ class ScenarioDamageRiskCalculator(base.RiskCalculator):
 
     # FIXME. scenario damage calculator does not use output builders
     output_builders = []
+    getter_class = hazard_getters.GroundMotionValuesGetter
 
     def __init__(self, job):
         super(ScenarioDamageRiskCalculator, self).__init__(job)
         # let's define a dictionary taxonomy -> fractions
         # updated in task_completed method when the fractions per taxonomy
         # becomes available, as computed by the workers
-        self.ddpt = {}
+        self.acc = {}
         self.damage_state_ids = None
 
-    def calculation_unit(self, loss_type, assets):
+    @EnginePerformanceMonitor.monitor
+    def agg_result(self, acc, task_result):
         """
-        :returns:
-          a list of :class:`..base.CalculationUnit` instances
-        """
-        taxonomy = assets[0].taxonomy
-        model = self.risk_models[taxonomy][loss_type]
-
-        # no loss types support at the moment. Use the sentinel key
-        # "damage" instead of a loss type for consistency with other
-        # methods
-        ret = workflows.CalculationUnit(
-            loss_type,
-            calculators.Damage(model.fragility_functions),
-            hazard_getters.GroundMotionValuesGetter(
-                self.rc.hazard_outputs(),
-                assets,
-                self.rc.best_maximum_distance,
-                model.imt))
-        return ret
-
-    def task_completed(self, task_result):
-        """
-        Update the dictionary self.ddpt, i.e. aggregate the damage distribution
+        Update the dictionary acc, i.e. aggregate the damage distribution
         by taxonomy; called every time a block of assets is computed for each
         taxonomy. Fractions and taxonomy are extracted from task_result
 
         :param task_result:
             A pair (fractions, taxonomy)
         """
-        self.log_percent(task_result)
-        fractions, taxonomy = task_result
-
-        if fractions is not None:
-            if taxonomy not in self.ddpt:
-                self.ddpt[taxonomy] = numpy.zeros(fractions.shape)
-            self.ddpt[taxonomy] += fractions
+        acc = acc.copy()
+        for taxonomy, fractions in task_result.iteritems():
+            if fractions is not None:
+                if taxonomy not in acc:
+                    acc[taxonomy] = numpy.zeros(fractions.shape)
+                acc[taxonomy] += fractions
+        return acc
 
     def post_process(self):
         """
@@ -172,13 +140,13 @@ class ScenarioDamageRiskCalculator(base.RiskCalculator):
             self.job, "Collapse Map per Asset",
             "collapse_map")
 
-        if self.ddpt:
+        if self.acc:
             models.Output.objects.create_output(
                 self.job, "Damage Distribution per Taxonomy",
                 "dmg_dist_per_taxonomy")
 
         tot = None
-        for taxonomy, fractions in self.ddpt.iteritems():
+        for taxonomy, fractions in self.acc.iteritems():
             writers.damage_distribution_per_taxonomy(
                 fractions, self.damage_state_ids, taxonomy)
             if tot is None:  # only the first time
@@ -191,14 +159,20 @@ class ScenarioDamageRiskCalculator(base.RiskCalculator):
                 "dmg_dist_total")
             writers.total_damage_distribution(tot, self.damage_state_ids)
 
-    def get_risk_models(self, retrofitted=False):
+    def get_risk_models(self):
         """
         Load fragility model and store damage states
         """
-        risk_models, damage_state_ids = loaders.fragility(
-            self.rc, self.rc.inputs['fragility'])
+        risk_models = get_risk_models(models.oqparam(self.job.id))
 
-        self.damage_state_ids = damage_state_ids
+        for lsi, dstate in enumerate(risk_models.damage_states):
+            models.DmgState.objects.get_or_create(
+                risk_calculation=self.rc, dmg_state=dstate, lsi=lsi)
+
+        self.damage_state_ids = [d.id for d in models.DmgState.objects.filter(
+            risk_calculation=self.rc).order_by('lsi')]
+
+        self.loss_types.add('damage')  # single loss_type
         return risk_models
 
     @property
@@ -207,5 +181,4 @@ class ScenarioDamageRiskCalculator(base.RiskCalculator):
         Provides calculator specific params coming from
         :class:`openquake.engine.db.RiskCalculation`
         """
-
         return base.make_calc_params(damage_state_ids=self.damage_state_ids)

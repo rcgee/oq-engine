@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -15,15 +15,102 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Base RiskCalculator class."""
+"""
+Base RiskCalculator class.
+"""
 
 import collections
+import psutil
+
+from openquake.commonlib import risk_parsers
+from openquake.risklib.workflows import RiskModel
+from openquake.hazardlib.imt import from_string
+from openquake.commonlib.riskmodels import get_vfs
 
 from openquake.engine import logs, export
-from openquake.engine.utils import config
 from openquake.engine.db import models
 from openquake.engine.calculators import base
-from openquake.engine.calculators.risk import writers, validation, loaders
+from openquake.engine.calculators.risk import \
+    writers, validation, hazard_getters
+from openquake.engine.utils import config, tasks
+from openquake.engine.performance import EnginePerformanceMonitor
+from openquake.engine.input.exposure import ExposureDBWriter
+
+
+BLOCK_SIZE = 100  # number of assets per block
+
+MEMORY_ERROR = '''Running the calculation will require approximately
+%dM, i.e. more than the memory which is available right now (%dM).
+Please increase the free memory or apply a stringent region
+constraint to reduce the number of assets. Alternatively you can set
+epsilon_sampling in openquake.cfg. It the correlation is
+nonzero, consider setting asset_correlation=0 to avoid building the
+correlation matrix.'''
+
+
+@tasks.oqtask
+def build_getters(job_id, counts_taxonomy, calc):
+    """
+    :param job_id:
+        ID of the current risk job
+    :param counts_taxonomy:
+        a sorted list of pairs (counts, taxonomy) for each bunch of assets
+    :param calc:
+        :class:`openquake.engine.calculators.risk.base.RiskCalculator` instance
+    """
+    for counts, taxonomy in counts_taxonomy:
+        logs.LOG.info('taxonomy=%s, assets=%d', taxonomy, counts)
+
+        # building the GetterBuilder
+        with calc.monitor("associating asset->site"):
+            builder = hazard_getters.GetterBuilder(
+                taxonomy, calc.rc, calc.eps_sampling)
+
+        # estimating the needed memory
+        haz_outs = calc.rc.hazard_outputs()
+        nbytes = builder.calc_nbytes(haz_outs)
+        if nbytes:
+            # TODO: the estimate should be revised by taking into account
+            # the number of realizations
+            estimate_mb = nbytes / 1024 / 1024 * 3
+            phymem = psutil.phymem_usage()
+            available_memory = (1 - phymem.percent / 100) * phymem.total
+            available_mb = available_memory / 1024 / 1024
+            if nbytes * 3 > available_memory:
+                raise MemoryError(MEMORY_ERROR % (estimate_mb, available_mb))
+
+        # initializing the epsilons
+        builder.init_epsilons(haz_outs)
+
+        # building the tasks
+        task_no = 0
+        name = calc.core_calc_task.__name__ + '[%s]' % taxonomy
+        otm = tasks.OqTaskManager(calc.core_calc_task, logs.LOG.progress, name)
+
+        for offset in range(0, counts, BLOCK_SIZE):
+            with calc.monitor("getting asset chunks"):
+                assets = models.ExposureData.objects.get_asset_chunk(
+                    calc.rc, taxonomy, offset, BLOCK_SIZE)
+            with calc.monitor("building getters"):
+                try:
+                    getters = builder.make_getters(
+                        calc.getter_class, haz_outs, assets)
+                except hazard_getters.AssetSiteAssociationError as err:
+                    # TODO: add a test for this corner case
+                    # https://bugs.launchpad.net/oq-engine/+bug/1317796
+                    logs.LOG.warn('Taxonomy %s: %s', taxonomy, err)
+                    continue
+
+            # submitting task
+            task_no += 1
+            logs.LOG.info('Built task #%d for taxonomy %s', task_no, taxonomy)
+            for imt, taxo in calc.risk_models:
+                if taxo == taxonomy:
+                    risk_model = calc.risk_models[imt, taxonomy]
+                    otm.submit(job_id, risk_model, getters,
+                               calc.outputdict, calc.calculator_parameters)
+
+    return otm
 
 
 class RiskCalculator(base.Calculator):
@@ -46,28 +133,50 @@ class RiskCalculator(base.Calculator):
                   validation.OrphanTaxonomies, validation.ExposureLossTypes,
                   validation.NoRiskModels]
 
+    bcr = False  # flag overridden in BCR calculators
+
     def __init__(self, job):
         super(RiskCalculator, self).__init__(job)
-
         self.taxonomies_asset_count = None
         self.risk_models = None
+        self.loss_types = set()
+        self.acc = {}
+
+    def agg_result(self, acc, res):
+        """
+        Aggregation method, to be overridden in subclasses
+        """
+        return acc
 
     def pre_execute(self):
         """
         In this phase, the general workflow is:
             1. Parse the exposure to get the taxonomies
             2. Parse the available risk models
-            3. Initialize progress counters
-            4. Validate exposure and risk models
+            3. Validate exposure and risk models
         """
-        with logs.tracing('get exposure'):
+        with self.monitor('get exposure'):
+            exposure = self.rc.exposure_model
+            if exposure is None:
+                ExposureDBWriter(self.job).serialize(
+                    risk_parsers.ExposureModelParser(
+                        self.rc.inputs['exposure']))
             self.taxonomies_asset_count = \
-                (self.rc.preloaded_exposure_model or loaders.exposure(
-                    self.job, self.rc.inputs['exposure'])
-                 ).taxonomies_in(self.rc.region_constraint)
+                self.rc.exposure_model.taxonomies_in(self.rc.region_constraint)
 
-        with logs.tracing('parse risk models'):
+        with self.monitor('parse risk models'):
             self.risk_models = self.get_risk_models()
+
+        # populate ImtTaxonomy
+        imt_taxonomy_set = set()
+        for rm in self.risk_models.itervalues():
+            self.loss_types.update(rm.loss_types)
+            imt_taxonomy_set.add((rm.imt, rm.taxonomy))
+            # insert the IMT in the db, if not already there
+            models.Imt.save_new([from_string(rm.imt)])
+        for imt, taxonomy in imt_taxonomy_set:
+            models.ImtTaxonomy.objects.create(
+                job=self.job, imt=models.Imt.get(imt), taxonomy=taxonomy)
 
             # consider only the taxonomies in the risk models if
             # taxonomies_from_model has been set to True in the
@@ -76,7 +185,7 @@ class RiskCalculator(base.Calculator):
                 self.taxonomies_asset_count = dict(
                     (t, count)
                     for t, count in self.taxonomies_asset_count.items()
-                    if t in self.risk_models)
+                    if (imt, t) in self.risk_models)
 
         for validator_class in self.validators:
             validator = validator_class(self)
@@ -85,72 +194,25 @@ class RiskCalculator(base.Calculator):
                 raise ValueError("""Problems in calculator configuration:
                                  %s""" % error)
 
-    def expected_tasks(self, block_size):
+        num_assets = sum(self.taxonomies_asset_count.itervalues())
+        num_taxonomies = len(self.taxonomies_asset_count)
+        logs.LOG.info('Considering %d assets of %d distinct taxonomies',
+                      num_assets, num_taxonomies)
+        self.eps_sampling = int(config.get('risk', 'epsilon_sampling'))
+
+    @EnginePerformanceMonitor.monitor
+    def execute(self):
         """
-        Number of tasks generated by the task_arg_gen
+        Method responsible for the distribution strategy.
         """
-        num_tasks = 0
-        for num_assets in self.taxonomies_asset_count.values():
-            n, r = divmod(num_assets, block_size)
-            if r:
-                n += 1
-            num_tasks += n
-        return num_tasks
-
-    def concurrent_tasks(self):
-        """
-        Number of tasks to be in queue at any given time.
-        """
-        return int(config.get('risk', 'concurrent_tasks'))
-
-    def task_arg_gen(self):
-        """
-        Generator function for creating the arguments for each task.
-
-        It is responsible for the distribution strategy. It divides
-        the considered exposure into chunks of homogeneous assets
-        (i.e. having the same taxonomy). The chunk size is given by
-        the `block_size` openquake config parameter.
-
-        :returns:
-            An iterator over a list of arguments. Each contains:
-
-            1. the job id
-            2. a getter object needed to get the hazard data
-            3. the needed risklib calculators
-            4. the output containers to be populated
-            5. the specific calculator parameter set
-        """
-        block_size = int(config.get('risk', 'block_size'))
-
-        output_containers = writers.combine_builders(
-            [builder(self) for builder in self.output_builders])
-
-        num_tasks = 0
-        for taxonomy, assets_nr in self.taxonomies_asset_count.items():
-            asset_offsets = range(0, assets_nr, block_size)
-
-            for offset in asset_offsets:
-                with logs.tracing("getting assets"):
-                    assets = models.ExposureData.objects.get_asset_chunk(
-                        self.rc, taxonomy, offset, block_size)
-
-                calculation_units = [
-                    self.calculation_unit(loss_type, assets)
-                    for loss_type in models.loss_types(self.risk_models)]
-
-                num_tasks += 1
-                yield [self.job.id,
-                       calculation_units,
-                       output_containers,
-                       self.calculator_parameters]
-
-        # sanity check to protect against future changes of the distribution
-        # logic
-        expected_tasks = self.expected_tasks(block_size)
-        if num_tasks != expected_tasks:
-            raise RuntimeError('Expected %d tasks, generated %d!' % (
-                               expected_tasks, num_tasks))
+        self.outputdict = writers.combine_builders(
+            [ob(self) for ob in self.output_builders])
+        ct = sorted((counts, taxonomy) for taxonomy, counts
+                    in self.taxonomies_asset_count.iteritems())
+        self.acc = tasks.apply_reduce(
+            build_getters, (self.job.id, ct, self),
+            lambda acc, otm: otm.aggregate_results(self.agg_result, acc),
+            self.acc, self.concurrent_tasks)
 
     def _get_outputs_for_export(self):
         """
@@ -176,13 +238,14 @@ class RiskCalculator(base.Calculator):
         """
         return self.job.risk_calculation
 
+    # TODO: try to remove this
     @property
     def hc(self):
         """
         A shorter and more convenient way of accessing the
-        :class:`~openquake.engine.db.models.HazardCalculation`.
+        hazard parameters
         """
-        return self.rc.get_hazard_calculation()
+        return self.rc.get_hazard_param()
 
     @property
     def calculator_parameters(self):
@@ -193,24 +256,32 @@ class RiskCalculator(base.Calculator):
         """
         return []
 
-    def get_risk_models(self, retrofitted=False):
-        """
-        Parse vulnerability models for each loss type in
-        `openquake.engine.db.models.LOSS_TYPES`,
-        then set the `risk_models` attribute.
+    def get_risk_models(self):
+        # regular risk models
+        if self.bcr is False:
+            return dict(
+                (imt_taxo, RiskModel(imt_taxo[0], imt_taxo[1],
+                                     self.get_workflow(vfs)))
+                for imt_taxo, vfs in get_vfs(self.rc.inputs).iteritems())
 
-        :param bool retrofitted:
-            True if retrofitted models should be retrieved
-        :returns:
-            A nested dict taxonomy -> loss type -> instances of `RiskModel`.
-        """
-        risk_models = collections.defaultdict(dict)
+        # BCR risk models
+        orig_data = get_vfs(self.rc.inputs, retrofitted=False).items()
+        retro_data = get_vfs(self.rc.inputs, retrofitted=True).items()
 
-        for v_input, loss_type in self.rc.vulnerability_inputs(retrofitted):
-            for taxonomy, model in loaders.vulnerability(v_input):
-                risk_models[taxonomy][loss_type] = model
-
+        risk_models = {}
+        for (imt_taxo, vfs), (imt_taxo_, vfs_) in zip(orig_data, retro_data):
+            assert imt_taxo_ == imt_taxo_  # same imt and taxonomy
+            risk_models[imt_taxo] = RiskModel(
+                imt_taxo[0], imt_taxo[1], self.get_workflow(vfs, vfs_))
         return risk_models
+
+    def get_workflow(self, vulnerability_functions):
+        """
+        To be overridden in subclasses. Must return a workflow instance.
+        """
+        class Workflow():
+            vulnerability_functions = {}
+        return Workflow()
 
 #: Calculator parameters are used to compute derived outputs like loss
 #: maps, disaggregation plots, quantile/mean curves. See

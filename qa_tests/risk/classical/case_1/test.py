@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -103,6 +103,8 @@ class ClassicalRiskCase1TestCase(risk.BaseRiskQATestCase):
             (0.60, 0.000757544444296432), (0.70, 0.000272824002045979),
             (0.80, 0.00), (0.9, 0.00), (1.0, 0.00)]
 
+        models.HazardSite.objects.create(
+            hazard_calculation=job, location="POINT(1 1)")
         models.HazardCurveData.objects.create(
             hazard_curve=models.HazardCurve.objects.create(
                 output=models.Output.objects.create_output(
@@ -121,8 +123,8 @@ class ClassicalRiskCase1TestCase(risk.BaseRiskQATestCase):
                     loss_curve__output__oq_job=job).order_by('asset_ref')] +
                 [point.value
                  for point in models.LossMapData.objects.filter(
-                    loss_map__output__oq_job=job).order_by(
-                        'asset_ref', 'loss_map__poe')])
+                     loss_map__output__oq_job=job).order_by(
+                     'asset_ref', 'loss_map__poe')])
 
     def expected_data(self):
         return [[

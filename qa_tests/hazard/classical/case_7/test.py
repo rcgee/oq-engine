@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -82,11 +82,12 @@ class ClassicalHazardCase7TestCase(qa_utils.BaseQATestCase):
             job = self.run_hazard(cfg)
 
             # Test the poe values for the two curves.
-            actual_curve_b1, actual_curve_b2 = \
-                models.HazardCurveData.objects\
-                    .filter(hazard_curve__output__oq_job=job.id,
-                            hazard_curve__lt_realization__isnull=False)\
-                    .order_by('hazard_curve__lt_realization__sm_lt_path')
+            actual_curve_b1, actual_curve_b2 = (
+                models.HazardCurveData.objects
+                .filter(hazard_curve__output__oq_job=job.id,
+                        hazard_curve__lt_realization__isnull=False)
+                .order_by('hazard_curve__lt_realization__lt_model__sm_lt_path')
+            )
 
             # Sanity check, to make sure we have the curves ordered correctly:
             self.assertEqual(

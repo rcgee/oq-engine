@@ -4,7 +4,7 @@
 # pylint: disable=C0103,R0904
 # pylint: enable=W0511,W0142,I0011,E1101,E0611,F0401,E1103,R0801,W0232
 
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -46,10 +46,11 @@ class TestCaseWithAJob(unittest.TestCase):
         cfg = helpers.get_data_path('simple_fault_demo_hazard/job.ini')
         self.job = helpers.get_job(cfg, username="test_user")
         for i in range(0, random.randint(1, 10)):
+            lt_model = models.LtSourceModel.objects.create(
+                hazard_calculation=self.job, ordinal=i, sm_lt_path=[i])
             models.LtRealization(
-                hazard_calculation=self.job.hazard_calculation,
-                ordinal=i, seed=None, weight=1 / (i + 1), sm_lt_path=[i],
-                gsim_lt_path=[i]).save()
+                lt_model=lt_model, ordinal=i,
+                weight=1 / (i + 1), gsim_lt_path=[i]).save()
 
 
 class OutputManagerTestCase(TestCaseWithAJob):
@@ -143,9 +144,10 @@ class AssetManagerTestCase(unittest.TestCase):
         m2 = p2.start()
         m2.return_value = ("cost_type_fields", "cost_type_joins")
 
+        asset_ids = [13, 14]
         try:
             query, args = self.manager._get_asset_chunk_query_args(
-                rc, "taxonomy", 0, 1)
+                rc, "taxonomy", 0, 1, asset_ids)
             self.assertEqual("""
             SELECT riski.exposure_data.*,
                    occupants_fields AS people,
@@ -157,16 +159,15 @@ class AssetManagerTestCase(unittest.TestCase):
             WHERE exposure_model_id = %s AND
                   taxonomy = %s AND
                   ST_COVERS(ST_GeographyFromText(%s), site) AND
-                  occupants_cond
+                  occupants_cond AND riski.exposure_data.id IN (13, 14)
             GROUP BY riski.exposure_data.id
             ORDER BY ST_X(geometry(site)), ST_Y(geometry(site))
-            LIMIT %s OFFSET %s
-            """, query)
+            LIMIT 1""", query)
 
             self.assertEqual(args,
                              (0, 'taxonomy',
                               'SRID=4326; REGION CONSTRAINT',
-                              'occ_arg1', 'occ_arg2', 1, 0))
+                              'occ_arg1', 'occ_arg2'))
         finally:
             p1.stop()
             p2.stop()

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -22,34 +22,43 @@ Task functions for our unit tests.
 
 import sys
 import functools
+import traceback
+
 from celery.task import task
 
+from openquake.commonlib.parallel import Pickled
+from openquake.engine.utils.tasks import oqtask
 
+
+# mimic the behavior of oqtask
 def test_task(func):
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args):
         try:
-            return func(*args, **kwargs), None
+            res = func(*[a.unpickle() for a in args])
+            return Pickled((res, None))
         except:
-            exctype, exc, _tb = sys.exc_info()
-            return str(exc), exctype
+            exctype, exc, tb = sys.exc_info()
+            tb_str = ''.join(traceback.format_tb(tb))
+            err_msg = '\n%s%s: %s' % (tb_str, exctype.__name__, exc)
+            return Pickled((err_msg, exctype))
     return task(wrapper)
 
 
 @test_task
-def reflect_args(*args, **kwargs):
+def reflect_args(*args):
     """Merely returns the parameters received."""
-    return (args, kwargs)
+    return args
 
 
 @test_task
-def just_say_hello(*args, **kwargs):
+def just_say_hello(*args):
     """Merely returns 'hello'."""
     return "hello"
 
 
 @test_task
-def just_say_1(*args, **kwargs):
+def just_say_1(*args):
     """Merely returns 1."""
     return 1
 
@@ -73,3 +82,14 @@ def failing_task(data):
 def reflect_data_to_be_processed(data):
     """Merely returns the data received."""
     return data
+
+
+@oqtask
+def fake_risk_task(job_id, risk_model, getters, outputdict, params):
+    """Used in tests.calculators.risk.base"""
+    return {job_id: 1}
+
+
+@test_task
+def get_even(job_id, numbers):
+    return [n for n in numbers if n % 2 == 0]

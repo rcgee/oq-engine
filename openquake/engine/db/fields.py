@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -14,6 +14,8 @@
 # along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
 
 """Custom Django field and formfield types (for models and forms."""
+
+import ast
 
 import numpy
 import re
@@ -151,7 +153,7 @@ class IntArrayField(djm.Field):
 class CharArrayField(djm.Field):
     """This field models a postgres `varchar` array."""
 
-    def db_type(self, _connection):
+    def db_type(self, _connection=None):
         return 'varchar[]'
 
     def to_python(self, value):
@@ -201,6 +203,25 @@ class CharArrayField(djm.Field):
         defaults = {'form_class': StringArrayFormField}
         defaults.update(kwargs)
         return super(CharArrayField, self).formfield(**defaults)
+
+
+class LiteralField(djm.Field):
+    """
+    Convert from Postgres TEXT to Python objects and viceversa by using
+    `ast.literal_eval` and `repr`.
+    """
+
+    __metaclass__ = djm.SubfieldBase
+
+    def db_type(self, _connection=None):
+        return 'text'
+
+    def to_python(self, value):
+        if value is not None:
+            return ast.literal_eval(value)
+
+    def get_prep_value(self, value):
+        return repr(value)
 
 
 class PickleField(djm.Field):

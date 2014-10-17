@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -17,11 +17,9 @@
 
 from openquake.engine import logs
 from openquake.engine.performance import EnginePerformanceMonitor
-from openquake.engine.utils import tasks
+from openquake.engine.utils import tasks, config
 
-# Routing key format string for communication between tasks and the control
-# node.
-ROUTING_KEY_FMT = 'oq.job.%(job_id)s.tasks'
+from openquake.commonlib.source import SourceCollector
 
 
 class Calculator(object):
@@ -38,8 +36,18 @@ class Calculator(object):
     def __init__(self, job):
         self.job = job
         self.num_tasks = None
+        self._task_args = []
+        # parameters from openquake.cfg
+        self.concurrent_tasks = int(
+            config.get('celery', 'concurrent_tasks'))
+        self.max_input_weight = float(
+            config.get('hazard', 'max_input_weight'))
+        self.max_output_weight = float(
+            config.get('hazard', 'max_output_weight'))
+        SourceCollector.POINT_SOURCE_WEIGHT = float(
+            config.get('hazard', 'point_source_weight'))
 
-    def monitor(self, operation):
+    def monitor(self, operation=None):
         """
         Return a :class:`openquake.engine.performance.EnginePerformanceMonitor`
         instance, associated to the operation and with tracing and flushing
@@ -58,22 +66,13 @@ class Calculator(object):
         """
         raise NotImplementedError
 
-    def concurrent_tasks(self):
-        """
-        Number of tasks to be in queue at any given time.
-
-        Subclasses must implement this.
-        """
-        raise NotImplementedError
-
     def parallelize(self, task_func, task_arg_gen, task_completed):
         """
         Given a callable and a task arg generator, build an argument list and
         apply the callable to the arguments in parallel. The order is not
         preserved.
 
-        Every time a task completes the method .task_completed() is called
-        which by default simply display the progress percentage.
+        Every time a task completes the method .task_completed() is called.
 
         :param task_func: a `celery` task callable
         :param task_args: an iterable over positional arguments
@@ -81,41 +80,20 @@ class Calculator(object):
         NB: if the environment variable OQ_NO_DISTRIBUTE is set the
         tasks are run sequentially in the current process.
         """
-        arglist = self.initialize_percent(task_func, task_arg_gen)
-        tasks.parallelize(task_func, arglist, task_completed)
-
-    def initialize_percent(self, task_func, task_arg_gen):
-        self.taskname = task_func.__name__
-        arglist = list(task_arg_gen)
-        self.num_tasks = len(arglist)
-        self.tasksdone = 0
-        self.percent = 0.0
-        logs.LOG.progress(
-            'spawning %d tasks of kind %s', self.num_tasks, self.taskname)
-        return arglist
+        oqm = tasks.OqTaskManager(task_func, logs.LOG.progress)
+        with self.monitor('submitting %s' % task_func.__name__):
+            for args in task_arg_gen:
+                oqm.submit(*args)
+        oqm.aggregate_results(lambda acc, val: task_completed(val), None)
 
     def task_completed(self, task_result):
         """
         Method called when a task is completed. It can be overridden
-        to aggregate the partial results of a computation. By default
-        it just calls the method .log_percent.
+        to aggregate the partial results of a computation.
 
         :param task_result: the result of the task
         """
-        self.log_percent(task_result)
-
-    def log_percent(self, task_result=None):
-        """
-        Log the progress percentage, if changed.
-        It is called at each task completion.
-
-        :param task_result: the result of the task (often None)
-        """
-        self.tasksdone += 1
-        percent = int(float(self.tasksdone) / self.num_tasks * 100)
-        if percent > self.percent:
-            logs.LOG.progress('> %s %3d%%', self.taskname, percent)
-            self.percent = percent
+        pass
 
     def pre_execute(self):
         """
@@ -123,6 +101,7 @@ class Calculator(object):
         initialize result records, perform detailed parsing of input data, etc.
         """
 
+    @EnginePerformanceMonitor.monitor
     def execute(self):
         """
         Run the core_calc_task in parallel, by passing the arguments
@@ -182,7 +161,7 @@ class Calculator(object):
                                           % (output.output_type, export_type)):
                             fname = self._do_export(
                                 output.id,
-                                self.job.calculation.export_dir,
+                                self.job.get_param('export_dir'),
                                 export_type
                             )
                             logs.LOG.info('exported %s', fname)

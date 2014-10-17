@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -44,9 +44,10 @@ class ClassicalBCRRiskCalculatorTestCase(base_test.BaseRiskCalculatorTestCase):
     def test_complete_workflow(self):
         # Test the complete risk classical calculation workflow and test
         # for the presence of the outputs
+        self.job.is_running = True
+        self.job.save()
         self.calculator.pre_execute()
 
-        self.job.is_running = True
         self.job.status = 'executing'
         self.job.save()
         self.calculator.execute()

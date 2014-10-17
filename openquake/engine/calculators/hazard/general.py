@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -20,19 +20,29 @@
 
 import os
 import random
+import itertools
 import collections
+from operator import attrgetter
 
-from openquake.hazardlib import correlation
+from django.contrib.gis.geos.point import Point
+
+import numpy
+
 from openquake.hazardlib.imt import from_string
 
 # FIXME: one must import the engine before django to set DJANGO_SETTINGS_MODULE
 from openquake.engine.db import models
 from django.db import transaction
 
-from openquake.nrmllib import parsers as nrml_parsers
-from openquake.nrmllib.risk import parsers
+from openquake.commonlib import risk_parsers
+from openquake.commonlib import InvalidFile
 
-from openquake.engine.input import source, exposure
+from openquake.commonlib import logictree, source
+from openquake.commonlib.general import split_in_blocks, distinct
+from openquake.commonlib.readinput import (
+    get_site_collection, get_site_model, get_imtls)
+
+from openquake.engine.input import exposure
 from openquake.engine import logs
 from openquake.engine import writer
 from openquake.engine.calculators import base
@@ -41,85 +51,144 @@ from openquake.engine.calculators.post_processing import quantile_curve
 from openquake.engine.calculators.post_processing import (
     weighted_quantile_curve
 )
+from openquake.engine.calculators.hazard.post_processing import (
+    hazard_curves_to_hazard_map, do_uhs_post_proc)
+
 from openquake.engine.export import core as export_core
 from openquake.engine.export import hazard as hazard_export
-from openquake.engine.input import logictree
-from openquake.engine.utils import config
-from openquake.engine.utils.general import \
-    block_splitter, SequenceSplitter, ceil
 from openquake.engine.performance import EnginePerformanceMonitor
-
-# this is needed to avoid running out of memory
-MAX_BLOCK_SIZE = 1000
-
-#: Maximum number of hazard curves to cache, for selects or inserts
-CURVE_CACHE_SIZE = 100000
+from openquake.engine.utils import tasks
 
 QUANTILE_PARAM_NAME = "QUANTILE_LEVELS"
 POES_PARAM_NAME = "POES"
 # Dilation in decimal degrees (http://en.wikipedia.org/wiki/Decimal_degrees)
 # 1e-5 represents the approximate distance of one meter at the equator.
 DILATION_ONE_METER = 1e-5
+ # the following is quite arbitrary, it gives output weights that I like (MS)
+NORMALIZATION_FACTOR = 1E-4
+# the following is also arbitrary, it is used to decide when to parallelize
+# the filtering (MS)
+LOTS_OF_SOURCES_SITES = 1E4
 
 
-def store_site_model(job, site_model_source):
-    """Invoke site model parser and save the site-specified parameter data to
-    the database.
+class InputWeightLimit(Exception):
+    pass
+
+
+class OutputWeightLimit(Exception):
+    pass
+
+
+def all_equal(obj, value):
+    """
+    :param obj: a numpy array or something else
+    :param value: a numeric value
+    :returns: a boolean
+    """
+    eq = (obj == value)
+    if isinstance(eq, numpy.ndarray):
+        return eq.all()
+    else:
+        return eq
+
+
+@tasks.oqtask
+def filter_and_split_sources(job_id, sources, sitecol):
+    """
+    Filter and split a list of hazardlib sources.
+
+    :param int job_id: ID of the current job
+    :param list sources: the original sources
+    :param sitecol: a :class:`openquake.hazardlib.site.SiteCollection` instance
+    """
+    hc = models.oqparam(job_id)
+    discr = hc.area_source_discretization
+    maxdist = hc.maximum_distance
+    srcs = []
+    for src in sources:
+        sites = src.filter_sites_by_distance_to_source(maxdist, sitecol)
+        if sites is not None:
+            for ss in source.split_source(src, discr):
+                srcs.append(ss)
+    return srcs
+
+
+class AllSources(object):
+    """
+    A container for sources of different tectonic region types.
+    The `split` method yields pairs (trt_model, block-of-sources).
+    """
+    def __init__(self):
+        self.sources = []
+        self.weight = {}
+        self.trt_model = {}
+
+    def append(self, src, weight, trt_model):
+        """
+        Collect a source, together with its weight and trt_model.
+        """
+        self.sources.append(src)
+        self.weight[src] = weight
+        self.trt_model[src] = trt_model
+
+    def split(self, hint):
+        """
+        Split the sources in a number of blocks close to the given `hint`.
+
+        :param int hint: hint for the number of blocks
+        """
+        if self.sources:
+            for block in split_in_blocks(
+                    self.sources, hint,
+                    self.weight.__getitem__,
+                    self.trt_model.__getitem__):
+                trt_model = self.trt_model[block[0]]
+                yield trt_model, block
+
+    def get_total_weight(self):
+        """
+        Return the total weight of the sources
+        """
+        return sum(self.weight.itervalues())
+
+
+class SiteModelParams(object):
+    """
+    Wrapper around the SiteModel table with a method .get_closest
 
     :param job:
-        The job that is loading this site_model_source
-    :param site_model_source:
-        Filename or file-like object containing the site model XML data.
-    :returns:
-        `list` of ids of the newly-inserted `hzrdi.site_model` records.
+        a :class:`openquake.engine.db.models.OqJob` instance
+    :param site_model_objects:
+        an iterable over objects with attributes
+        vs30, measured, z1pt0, z2pt5, lon, lat
     """
-    parser = nrml_parsers.SiteModelParser(site_model_source)
-    data = [models.SiteModel(vs30=node.vs30,
-                             vs30_type=node.vs30_type,
-                             z1pt0=node.z1pt0,
-                             z2pt5=node.z2pt5,
-                             location=node.wkt,
-                             job_id=job.id)
-            for node in parser.parse()]
-    return writer.CacheInserter.saveall(data)
+    def __init__(self, job, site_model_objects):
+        self.job = job
+        data = [models.SiteModel(
+                vs30=obj.vs30,
+                vs30_type='measured' if obj.measured else 'inferred',
+                z1pt0=obj.z1pt0,
+                z2pt5=obj.z2pt5,
+                location=Point(obj.lon, obj.lat),
+                job_id=job.id)
+                for obj in site_model_objects]
+        writer.CacheInserter.saveall(data)
 
-
-def im_dict_to_hazardlib(im_dict):
-    """
-    Given the dict of intensity measure types and levels, convert them to a
-    dict with the same values, except create :mod:`mhlib.imt` objects for the
-    new keys.
-
-    :returns:
-        A dict of intensity measure level lists, keyed by an IMT object. See
-        :mod:`openquake.hazardlib.imt` for more information.
-    """
-    # TODO: file a bug about  SA periods in hazardlib imts.
-    # Why are values of 0.0 not allowed? Technically SA(0.0) means PGA, but
-    # there must be a reason why we can't do this.
-    return dict((from_string(imt), imls) for imt, imls in im_dict.items())
-
-
-def get_correl_model(hc):
-    """
-    Helper function for constructing the appropriate correlation model.
-
-    :param hc:
-        A :class:`openquake.engine.db.models.HazardCalculation` instance.
-
-    :returns:
-        A correlation object. See :mod:`openquake.hazardlib.correlation` for
-        more info.
-    """
-    correl_model_cls = getattr(
-        correlation,
-        '%sCorrelationModel' % hc.ground_motion_correlation_model,
-        None)
-    if correl_model_cls is None:
-        # There's no correlation model for this calculation.
-        return None
-
-    return correl_model_cls(**hc.ground_motion_correlation_params)
+    def get_closest(self, lon, lat):
+        """
+        :param lon: a given longitude
+        :param lat: a given latitude
+        :returns:
+           the SiteMode record closest to the given longitude and latitude
+        """
+        query = """\
+        SELECT s.*, min(ST_Distance_Sphere(
+                        location, 'SRID=4326; POINT(%s %s)')) AS min_dist
+        FROM hzrdi.site_model AS s
+        WHERE job_id = %d GROUP BY id
+        ORDER BY min_dist LIMIT 1;""" % (lon, lat, self.job.id)
+        [sm] = models.SiteModel.objects.raw(query)
+        return sm
 
 
 class BaseHazardCalculator(base.Calculator):
@@ -130,125 +199,299 @@ class BaseHazardCalculator(base.Calculator):
 
     def __init__(self, job):
         super(BaseHazardCalculator, self).__init__(job)
-        # a dictionary (sm_lt_path, source_type) -> sources
-        self.source_blocks_per_ltpath = collections.defaultdict(list)
+        # a dictionary trt_model_id -> num_ruptures
+        self.num_ruptures = collections.defaultdict(int)
+        # now a dictionary (trt_model_id, gsim) -> poes
+        self.curves = {}
+        self.hc = models.oqparam(self.job.id)
+        self.mean_hazard_curves = getattr(
+            self.hc, 'mean_hazard_curves', None)
+        self.quantile_hazard_curves = getattr(
+            self.hc, 'quantile_hazard_curves', ())
 
-    def clean_up(self, *args, **kwargs):
-        """Clean up dictionaries at the end"""
-        self.source_blocks_per_ltpath.clear()
-
-    @property
-    def hc(self):
+    @EnginePerformanceMonitor.monitor
+    def process_sources(self):
         """
-        A shorter and more convenient way of accessing the
-        :class:`~openquake.engine.db.models.HazardCalculation`.
+        Filter and split the sources in parallel.
+        Return the list of processed sources.
         """
-        return self.job.hazard_calculation
-
-    # NB: this method will be replaces SequenceSplitter.split sooner or later
-    def block_split(self, items, max_block_size=MAX_BLOCK_SIZE):
-        """
-        Split the given items in blocks, depending on the parameter
-        concurrent tasks. Notice that in order to save memory there
-        is a maximum block size of %d items.
-
-        :param list items: the items to split in blocks
-        """ % MAX_BLOCK_SIZE
-        assert len(items) > 0, 'No items in %s' % items
-        num_rlzs = len(self._get_realizations())
-        bs = min(ceil(len(items), ceil(self.concurrent_tasks(), num_rlzs)),
-                 max_block_size)
-        logs.LOG.warn('Using block size=%d', bs)
-        return block_splitter(items, bs)
-
-    def concurrent_tasks(self):
-        """
-        For hazard calculators, the number of tasks to be in queue
-        at any given time is specified in the configuration file.
-        """
-        return int(config.get('hazard', 'concurrent_tasks'))
+        self.all_sources = AllSources()
+        self.job.is_running = True
+        self.job.save()
+        num_models = len(self.source_collector)
+        num_sites = len(self.site_collection)
+        for i, trt_model_id in enumerate(sorted(self.source_collector), 1):
+            trt_model = models.TrtModel.objects.get(pk=trt_model_id)
+            sc = self.source_collector[trt_model_id]
+            # NB: the filtering of the sources by site is slow, so it is
+            # done in parallel
+            sm_lt_path = tuple(trt_model.lt_model.sm_lt_path)
+            logs.LOG.progress(
+                '[%d of %d] Filtering/splitting %d source(s) for '
+                'sm_lt_path=%s, TRT=%s, model=%s', i, num_models,
+                len(sc.sources), sm_lt_path, trt_model.tectonic_region_type,
+                trt_model.lt_model.sm_name)
+            if len(sc.sources) * num_sites > LOTS_OF_SOURCES_SITES:
+                # filter in parallel
+                sc.sources = tasks.apply_reduce(
+                    filter_and_split_sources,
+                    (self.job.id, sc.sources, self.site_collection),
+                    list.__add__, [])
+            else:  # few sources and sites
+                # filter sequentially on a single core
+                sc.sources = filter_and_split_sources.task_func(
+                    self.job.id, sc.sources, self.site_collection)
+            sc.sources.sort(key=attrgetter('source_id'))
+            if not sc.sources:
+                logs.LOG.warn(
+                    'Could not find sources close to the sites in %s '
+                    'sm_lt_path=%s, maximum_distance=%s km',
+                    trt_model.lt_model.sm_name, sm_lt_path,
+                    self.hc.maximum_distance)
+                continue
+            for src in sc.sources:
+                self.all_sources.append(
+                    src, sc.update_num_ruptures(src), trt_model)
+            trt_model.num_sources = len(sc.sources)
+            trt_model.num_ruptures = sc.num_ruptures
+            trt_model.save()
+        return self.all_sources.get_total_weight()
 
     def task_arg_gen(self):
         """
         Loop through realizations and sources to generate a sequence of
         task arg tuples. Each tuple of args applies to a single task.
-
-        For this default implementation, yielded results are quartets
-        (job_id, sources, tom, gsims_by_rlz).
-
-        Override this in subclasses as necessary.
+        Yielded results are of the form
+        (job_id, site_collection, sources, trt_model_id, gsims).
         """
-        ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
-        for ltpath, rlzs in self.rlzs_per_ltpath.iteritems():
-            gsims_by_rlz = collections.OrderedDict(
-                (rlz, ltp.parse_gmpe_logictree_path(rlz.gsim_lt_path))
-                for rlz in rlzs)
-            for block in self.source_blocks_per_ltpath[ltpath]:
-                yield self.job.id, block, gsims_by_rlz
+        if self._task_args:
+            # the method was already called and the arguments generated
+            for args in self._task_args:
+                yield args
+            return
+        sitecol = self.site_collection
+        task_no = 0
+        tot_sources = 0
+        for trt_model, block in self.all_sources.split(self.concurrent_tasks):
+            args = (self.job.id, sitecol, block, trt_model.id)
+            self._task_args.append(args)
+            yield args
+            tot_sources += len(block)
+            task_no += 1
+            logs.LOG.info('Submitting task #%d, %d source(s), weight=%d',
+                          task_no, len(block), block.weight)
+        logs.LOG.info('Processed %d sources for %d TRTs',
+                      tot_sources, len(self.source_collector))
+
+    def task_completed(self, result):
+        """
+        Simply call the method `agg_curves`.
+
+        :param result: the result of the .core_calc_task
+        """
+        self.agg_curves(self.curves, result)
+
+    @EnginePerformanceMonitor.monitor
+    def agg_curves(self, acc, result):
+        """
+        This is used to incrementally update hazard curve results by combining
+        an initial value with some new results. (Each set of new results is
+        computed over only a subset of seismic sources defined in the
+        calculation model.)
+
+        :param acc:
+            A dictionary of curves
+        :param result:
+            A dictionary `{trt_model_id: (curves_by_gsim, bbs)}`.
+            `curves_by_gsim` is a list of pairs `(gsim, curves_by_imt)`
+            where `curves_by_imt` is a list of 2-D numpy arrays
+            representing the new results which need to be combined
+            with the current value. These should be the same shape as
+            `acc[tr_model_id, gsim][j]` where `gsim` is the GSIM
+            name and `j` is the IMT ordinal.
+        """
+        for trt_model_id, (curves_by_gsim, bbs) in result.iteritems():
+            for gsim, probs in curves_by_gsim:
+                pnes = []
+                for prob, zero in itertools.izip(probs, self.zeros):
+                    pnes.append(1 - (zero if all_equal(prob, 0) else prob))
+                pnes1 = numpy.array(pnes)
+                pnes2 = 1 - acc.get((trt_model_id, gsim), self.zeros)
+                acc[trt_model_id, gsim] = 1 - pnes1 * pnes2
+
+            if getattr(self.hc, 'poes_disagg', None):
+                for bb in bbs:
+                    self.bb_dict[bb.lt_model_id, bb.site_id].update_bb(bb)
+
+        return acc
 
     def _get_realizations(self):
         """
         Get all of the logic tree realizations for this calculation.
         """
         return models.LtRealization.objects\
-            .filter(hazard_calculation=self.hc).order_by('id')
+            .filter(lt_model__hazard_calculation=self.job).order_by('id')
 
     def pre_execute(self):
         """
-        Initialize risk models, site model, sources and realizations
+        Initialize risk models, site model and sources
         """
-        self.parse_risk_models()
-        self.initialize_site_model()
-        num_sources = self.initialize_sources()
-        js = models.JobStats.objects.get(oq_job=self.job)
-        js.num_sources = num_sources
-        js.save()
+        # if you don't use an explicit transaction, errors will be masked
+        # the problem is that Django by default performs implicit transactions
+        # without rollback, see
+        # https://docs.djangoproject.com/en/1.3/topics/db/transactions/
+        with transaction.commit_on_success(using='job_init'):
+            self.parse_risk_models()
+        with transaction.commit_on_success(using='job_init'):
+            self.initialize_site_collection()
+        with transaction.commit_on_success(using='job_init'):
+            self.initialize_sources()
+
+        # The input weight is given by the number of ruptures generated
+        # by the sources; for point sources however a corrective factor
+        # given by the parameter `point_source_weight` is applied
+        input_weight = self.process_sources()
+
+        self.imtls = getattr(self.hc, 'intensity_measure_types_and_levels', {})
+        n_sites = len(self.site_collection)
+
+        # the imtls dictionary has values None when the levels are unknown
+        # (this is a valid case for the event based hazard calculator)
+        if None in self.imtls.values():  # there are no levels
+            n_imts = len(self.hc.intensity_measure_types_and_levels)
+            n_levels = 0
+        else:  # there are levels
+            n_imts = float(len(self.imtls))
+            n_levels = sum(len(lvls) for lvls in self.imtls.itervalues()
+                           ) / n_imts
+            self.zeros = numpy.array(
+                [numpy.zeros((n_sites, len(self.imtls[imt])))
+                 for imt in sorted(self.imtls)])
+            self.ones = [numpy.zeros(len(self.imtls[imt]), dtype=float)
+                         for imt in sorted(self.imtls)]
+            logs.LOG.info('%d IMT, %s level(s) and %d site(s)',
+                          n_imts, n_levels, n_sites)
+
+        # The output weight is a pure number which is proportional to the size
+        # of the expected output of the calculator. For classical and disagg
+        # calculators it is given by
+        # n_sites * n_realizations * n_imts * n_levels;
+        # for the event based calculator is given by n_sites * n_realizations
+        # * n_levels * n_imts * (n_ses * investigation_time) / 10000
+        max_realizations = self.get_max_realizations()
+        output_weight = n_sites * n_imts * max_realizations
+        if 'EventBased' in self.__class__.__name__:
+            total_time = (self.hc.investigation_time *
+                          self.hc.ses_per_logic_tree_path)
+            output_weight *= total_time * NORMALIZATION_FACTOR
+        else:
+            output_weight *= n_levels
+
+        logs.LOG.info('Total weight of the sources=%s', input_weight)
+        logs.LOG.info('Expected output size=%s', output_weight)
+        with transaction.commit_on_success(using='job_init'):
+            models.JobInfo.objects.create(
+                oq_job=self.job,
+                num_sites=n_sites,
+                num_realizations=max_realizations,
+                num_imts=n_imts,
+                num_levels=n_levels,
+                input_weight=input_weight,
+                output_weight=output_weight)
+        self.check_limits(input_weight, output_weight)
+        return input_weight, output_weight
+
+    def check_limits(self, input_weight, output_weight):
+        """
+        Compute the total weight of the source model and the expected
+        output size and compare them with the parameters max_input_weight
+        and max_output_weight in openquake.cfg; if the parameters are set
+        """
+        if (self.max_input_weight and
+                input_weight > self.max_input_weight):
+            raise InputWeightLimit(
+                'A limit of %d on the maximum source model weight was set. '
+                'The weight of your model is %d. Please reduce your model '
+                'or raise the parameter max_input_weight in openquake.cfg'
+                % (self.max_input_weight, input_weight))
+        elif self.max_output_weight and output_weight > self.max_output_weight:
+            raise OutputWeightLimit(
+                'A limit of %d on the maximum output weight was set. '
+                'The weight of your output is %d. Please reduce the number '
+                'of sites, the number of IMTs, the number of realizations '
+                'or the number of stochastic event sets; otherwise, '
+                'raise the parameter max_output_weight in openquake.cfg'
+                % (self.max_input_weight, input_weight))
+
+    def post_execute(self):
+        """Inizialize realizations"""
         self.initialize_realizations()
+        if self.curves:
+            # must be called after the realizations are known
+            self.save_hazard_curves()
 
     @EnginePerformanceMonitor.monitor
     def initialize_sources(self):
         """
         Parse source models and validate source logic trees. It also
         filters the sources far away and apply uncertainties to the
-        relevant ones. As a side effect it populates the instance dictionary
-        `.source_blocks_per_ltpath`. Notice that sources are automatically
-        split.
+        relevant ones. Notice that sources are automatically split.
 
         :returns:
             a list with the number of sources for each source model
         """
         logs.LOG.progress("initializing sources")
-        smlt_file = self.hc.inputs['source_model_logic_tree']
-        self.smlt = logictree.SourceModelLogicTree(
-            file(smlt_file).read(), self.hc.base_path, smlt_file)
-        sm_paths = list(self.smlt.get_sm_paths())
+        self.source_model_lt = logictree.SourceModelLogicTree.from_hc(self.hc)
+        sm_paths = distinct(self.source_model_lt)
+        nrml_to_hazardlib = source.SourceConverter(
+            self.hc.investigation_time,
+            self.hc.rupture_mesh_spacing,
+            self.hc.width_of_mfd_bin,
+            self.hc.area_source_discretization,
+        )
+        # define an ordered dictionary trt_model_id -> SourceCollector
+        self.source_collector = collections.OrderedDict()
+        for i, (sm, weight, smpath) in enumerate(sm_paths):
+            fname = os.path.join(self.hc.base_path, sm)
+            apply_unc = self.source_model_lt.make_apply_uncertainties(smpath)
+            try:
+                source_collectors = source.parse_source_model(
+                    fname, nrml_to_hazardlib, apply_unc)
+            except ValueError as e:
+                if str(e) in ('Surface does not conform with Aki & '
+                              'Richards convention',
+                              'Edges points are not in the right order'):
+                    raise InvalidFile('''\
+%s: %s. Probably you are using an obsolete model.
+In that case you can fix the file with the command
+python -m openquake.engine.tools.correct_complex_sources %s
+''' % (fname, e, fname))
+                else:
+                    raise
+            trts = [sc.trt for sc in source_collectors]
 
-        nblocks = ceil(config.get('hazard', 'concurrent_tasks'), len(sm_paths))
-        bs = SequenceSplitter(nblocks)
+            self.source_model_lt.tectonic_region_types.update(trts)
+            lt_model = models.LtSourceModel.objects.create(
+                hazard_calculation=self.job, sm_lt_path=smpath, ordinal=i,
+                sm_name=sm, weight=weight)
+            if self.hc.inputs.get('gsim_logic_tree'):  # check TRTs
+                gsims_by_trt = lt_model.make_gsim_lt(trts).values
+            else:
+                gsims_by_trt = {}
 
-        # here we are doing a full enumeration of the source model logic tree;
-        # this is not bad because for very large source models there are
-        # typically very few realizations; moreover, the filtering will remove
-        # most of the sources, so the memory occupation is typically low
-        num_sources = []  # the number of sources per sm_lt_path
-        for sm, path in sm_paths:
-            smpath = tuple(path)
-            source_weight_pairs = source.parse_source_model_smart(
-                os.path.join(self.hc.base_path, sm),
-                self.hc.sites_affected_by,
-                self.smlt.make_apply_uncertainties(path),
-                self.hc)
-            blocks = bs.split_on_max_weight(list(source_weight_pairs))
-            self.source_blocks_per_ltpath[smpath] = blocks
-            n = sum(len(block) for block in blocks)
-            logs.LOG.info('Found %d relevant source(s) for %s %s', n, sm, path)
-            logs.LOG.info('Splitting in %d blocks with max_weight=%s',
-                          len(blocks), bs.max_weight)
-            for i, block in enumerate(blocks, 1):
-                logs.LOG.info('Block %d: %d sources, weight %s',
-                              i, len(block), block.weight)
-            num_sources.append(n)
-        return num_sources
+            # save TrtModels for each tectonic region type
+            for sc in source_collectors:
+                # NB: the source_collectors are ordered by number of sources
+                # and lexicographically, so the models are in the right order
+                trt_model_id = models.TrtModel.objects.create(
+                    lt_model=lt_model,
+                    tectonic_region_type=sc.trt,
+                    num_sources=len(sc.sources),
+                    num_ruptures=sc.num_ruptures,
+                    min_mag=sc.min_mag,
+                    max_mag=sc.max_mag,
+                    gsims=gsims_by_trt.get(sc.trt, [])).id
+                self.source_collector[trt_model_id] = sc
 
     @EnginePerformanceMonitor.monitor
     def parse_risk_models(self):
@@ -259,89 +502,56 @@ class BaseHazardCalculator(base.Calculator):
         is one) and the imt (and levels) will be extracted from the
         vulnerability model (if there is one)
         """
-        hc = self.hc
-        if hc.vulnerability_models:
-            logs.LOG.progress("parsing risk models")
-
-            hc.intensity_measure_types_and_levels = dict()
-            hc.intensity_measure_types = list()
-
-            for vf in hc.vulnerability_models:
-                intensity_measure_types_and_levels = dict(
-                    (record['IMT'], record['IML']) for record in
-                    parsers.VulnerabilityModelParser(vf))
-
-                for imt, levels in \
-                        intensity_measure_types_and_levels.items():
-                    if (imt in hc.intensity_measure_types_and_levels and
-                        (set(hc.intensity_measure_types_and_levels[imt]) -
-                         set(levels))):
-                        logs.LOG.warning(
-                            "The same IMT %s is associated with "
-                            "different levels" % imt)
-                    else:
-                        hc.intensity_measure_types_and_levels[imt] = levels
-
-                hc.intensity_measure_types.extend(
-                    intensity_measure_types_and_levels)
-
-            # remove possible duplicates
-            if hc.intensity_measure_types is not None:
-                hc.intensity_measure_types = list(set(
-                    hc.intensity_measure_types))
-            hc.save()
-            logs.LOG.info("Got IMT and levels "
-                          "from vulnerability models: %s - %s" % (
-                              hc.intensity_measure_types_and_levels,
-                              hc.intensity_measure_types))
-
-        if 'fragility' in hc.inputs:
-            hc.intensity_measure_types_and_levels = dict()
-            hc.intensity_measure_types = list()
-
-            parser = iter(parsers.FragilityModelParser(
-                hc.inputs['fragility']))
-            hc = self.hc
-
-            fragility_format, _limit_states = parser.next()
-
-            if (fragility_format == "continuous" and
-                    hc.calculation_mode != "scenario"):
-                raise NotImplementedError(
-                    "Getting IMT and levels from "
-                    "a continuous fragility model is not yet supported")
-
-            hc.intensity_measure_types_and_levels = dict(
-                (iml['IMT'], iml['imls'])
-                for _taxonomy, iml, _params, _no_damage_limit in parser)
-            hc.intensity_measure_types.extend(
-                hc.intensity_measure_types_and_levels)
-            hc.save()
-
-        if 'exposure' in hc.inputs:
+        oqparam = self.job.get_oqparam()
+        imtls = get_imtls(oqparam)
+        if 'exposure' in oqparam.inputs:
             with logs.tracing('storing exposure'):
                 exposure.ExposureDBWriter(
                     self.job).serialize(
-                    parsers.ExposureModelParser(hc.inputs['exposure']))
+                    risk_parsers.ExposureModelParser(
+                        oqparam.inputs['exposure']))
+        models.Imt.save_new(map(from_string, imtls))
 
     @EnginePerformanceMonitor.monitor
-    def initialize_site_model(self):
+    def initialize_site_collection(self):
         """
-        Populate the hazard site table.
-
-        If a site model is specified in the calculation configuration,
-        parse it and load it into the `hzrdi.site_model` table.
+        Populate the hazard site table and create a sitecollection attribute.
         """
         logs.LOG.progress("initializing sites")
-        self.hc.points_to_compute(save_sites=True)
+        points, site_ids = self.job.save_hazard_sites()
+        if not site_ids:
+            raise RuntimeError('No sites were imported!')
 
-        site_model_inp = self.hc.site_model
-        if site_model_inp:
-            store_site_model(self.job, site_model_inp)
+        logs.LOG.progress("initializing site collection")
+        oqparam = self.job.get_oqparam()
+        if 'site_model' in oqparam.inputs:
+            sm_params = SiteModelParams(
+                self.job, get_site_model(oqparam))
+        else:
+            sm_params = None
+        self.site_collection = get_site_collection(
+            oqparam, points, site_ids, sm_params)
 
-    # Silencing 'Too many local variables'
-    # pylint: disable=R0914
-    @transaction.commit_on_success(using='job_init')
+    def get_max_realizations(self):
+        """
+        Return the number of realizations that will be generated.
+        In the event based case such number can be over-estimated,
+        if the method is called in the pre_execute phase, because
+        some tectonic region types may have no occurrencies. The
+        number is correct if the method is called in the post_execute
+        phase.
+        """
+        if self.hc.number_of_logic_tree_samples:
+            return self.hc.number_of_logic_tree_samples
+        gsim_lt_dict = {}  # gsim_lt per source model logic tree path
+        for sm, weight, sm_lt_path in self.source_model_lt:
+            lt_model = models.LtSourceModel.objects.get(
+                hazard_calculation=self.job, sm_lt_path=sm_lt_path)
+            if not sm_lt_path in gsim_lt_dict:
+                gsim_lt_dict[sm_lt_path] = lt_model.make_gsim_lt()
+        return sum(gsim_lt.get_num_paths()
+                   for gsim_lt in gsim_lt_dict.itervalues())
+
     def initialize_realizations(self):
         """
         Create records for the `hzrdr.lt_realization`.
@@ -353,73 +563,55 @@ class BaseHazardCalculator(base.Calculator):
         number of the realization (zero-based).
         """
         logs.LOG.progress("initializing realizations")
-        if self.job.hazard_calculation.number_of_logic_tree_samples > 0:
-            # random sampling of paths
-            self._initialize_realizations_montecarlo()
-        else:
-            # full paths enumeration
-            self._initialize_realizations_enumeration()
-
-        self.rlzs_per_ltpath = collections.OrderedDict()
-        for rlz in self._get_realizations():
-            ltpath = tuple(rlz.sm_lt_path)
-            if not ltpath in self.rlzs_per_ltpath:
-                self.rlzs_per_ltpath[ltpath] = [rlz]
+        num_samples = self.hc.number_of_logic_tree_samples
+        gsim_lt_dict = {}  # gsim_lt per source model logic tree path
+        for idx, (sm, weight, sm_lt_path) in enumerate(self.source_model_lt):
+            lt_model = models.LtSourceModel.objects.get(
+                hazard_calculation=self.job, sm_lt_path=sm_lt_path)
+            if not sm_lt_path in gsim_lt_dict:
+                gsim_lt_dict[sm_lt_path] = lt_model.make_gsim_lt()
+            gsim_lt = gsim_lt_dict[sm_lt_path]
+            if num_samples:  # sampling, pick just one gsim realization
+                rnd = random.Random(self.hc.random_seed + idx)
+                rlzs = [logictree.sample_one(gsim_lt, rnd)]
             else:
-                self.rlzs_per_ltpath[ltpath].append(rlz)
+                rlzs = list(gsim_lt)  # full enumeration
+            logs.LOG.info('Creating %d GMPE realization(s) for model %s, %s',
+                          len(rlzs), lt_model.sm_name, lt_model.sm_lt_path)
+            self._initialize_realizations(idx, lt_model, rlzs, gsim_lt)
+        num_ind_rlzs = sum(gsim_lt.get_num_paths()
+                           for gsim_lt in gsim_lt_dict.itervalues())
+        if num_samples > num_ind_rlzs:
+            logs.LOG.warn("""
+The number of independent realizations is %d but you are using %d samplings.
+That means that some GMPEs will be sampled more than once, resulting in
+duplicated data and redundant computation. You should switch to full
+enumeration mode, i.e. set number_of_logic_tree_samples=0 in your .ini file.
+""", num_ind_rlzs, num_samples)
 
-    def _initialize_realizations_enumeration(self):
-        """
-        Perform full paths enumeration of logic trees and populate
-        lt_realization table.
-        """
-        hc = self.job.hazard_calculation
-        ltp = logictree.LogicTreeProcessor.from_hc(hc)
-        for i, path_info in enumerate(ltp.enumerate_paths()):
-            source_model_filename, weight, sm_lt_path, gsim_lt_path = path_info
-            models.LtRealization.objects.create(
-                hazard_calculation=hc,
-                ordinal=i,
-                seed=None,
-                weight=weight,
-                sm_lt_path=sm_lt_path,
-                gsim_lt_path=gsim_lt_path)
-
-    def _initialize_realizations_montecarlo(self):
-        """
-        Perform random sampling of both logic trees and populate lt_realization
-        table.
-        """
-        # Each realization will have two seeds:
-        # One for source model logic tree, one for GSIM logic tree.
-        rnd = random.Random()
-        seed = self.hc.random_seed
-        rnd.seed(seed)
-
-        ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
-
-        # The first realization gets the seed we specified in the config file.
-        for i in xrange(self.hc.number_of_logic_tree_samples):
-            # Sample source model logic tree branch paths:
-            source_model_filename, sm_lt_path = (
-                ltp.sample_source_model_logictree(
-                    rnd.randint(models.MIN_SINT_32, models.MAX_SINT_32)))
-
-            # Sample GSIM logic tree branch paths:
-            gsim_lt_path = ltp.sample_gmpe_logictree(
-                rnd.randint(models.MIN_SINT_32, models.MAX_SINT_32))
-
-            models.LtRealization.objects.create(
-                hazard_calculation=self.hc,
-                ordinal=i,
-                seed=seed,
-                weight=None,
-                sm_lt_path=sm_lt_path,
-                gsim_lt_path=gsim_lt_path)
-
-            # update the seed for the next realization
-            seed = rnd.randint(models.MIN_SINT_32, models.MAX_SINT_32)
-            rnd.seed(seed)
+    @transaction.commit_on_success(using='job_init')
+    def _initialize_realizations(self, idx, lt_model, realizations, gsim_lt):
+        # create the realizations for the given lt source model
+        trt_models = lt_model.trtmodel_set.filter(num_ruptures__gt=0)
+        if not trt_models:
+            return
+        rlz_ordinal = idx * len(realizations)
+        for gsim_by_trt, weight, lt_path in realizations:
+            if lt_model.weight is not None and weight is not None:
+                weight = lt_model.weight * weight
+            else:
+                weight = None
+            rlz = models.LtRealization.objects.create(
+                lt_model=lt_model, gsim_lt_path=lt_path,
+                weight=weight, ordinal=rlz_ordinal)
+            rlz_ordinal += 1
+            for trt_model in trt_models:
+                trt = trt_model.tectonic_region_type
+                # populate the association table rlz <-> trt_model
+                models.AssocLtRlzTrtModel.objects.create(
+                    rlz=rlz, trt_model=trt_model, gsim=gsim_by_trt[trt])
+                trt_model.gsims = gsim_lt.values[trt]
+                trt_model.save()
 
     def _get_outputs_for_export(self):
         """
@@ -430,7 +622,7 @@ class BaseHazardCalculator(base.Calculator):
         outputs if this option was turned off in the calculation profile.
         """
         outputs = export_core.get_outputs(self.job.id)
-        if not self.hc.export_multi_curves:
+        if not getattr(self.hc, 'export_multi_curves', None):
             outputs = outputs.exclude(output_type='hazard_curve_multi')
         return outputs
 
@@ -443,6 +635,87 @@ class BaseHazardCalculator(base.Calculator):
         """
         return hazard_export.export(output_id, export_dir, export_type)
 
+    # this could be parallelized in the future, however in all the cases
+    # I have seen until now, the serialized approach is fast enough (MS)
+    @EnginePerformanceMonitor.monitor
+    def save_hazard_curves(self):
+        """
+        Post-execution actions. At the moment, all we do is finalize the hazard
+        curve results.
+        """
+        imtls = self.hc.intensity_measure_types_and_levels
+        points = models.HazardSite.objects.filter(
+            hazard_calculation=self.job).order_by('id')
+        sorted_imts = sorted(imtls)
+        curves_by_imt = dict((imt, []) for imt in sorted_imts)
+        individual_curves = self.job.get_param(
+            'individual_curves', missing=True)
+
+        for rlz in self._get_realizations():
+            if individual_curves:
+                # create a multi-imt curve
+                multicurve = models.Output.objects.create_output(
+                    self.job, "hc-multi-imt-rlz-%s" % rlz.id,
+                    "hazard_curve_multi")
+                models.HazardCurve.objects.create(
+                    output=multicurve, lt_realization=rlz,
+                    investigation_time=self.hc.investigation_time)
+
+            with self.monitor('building curves per realization'):
+                imt_curves = zip(
+                    sorted_imts, models.build_curves(rlz, self.curves))
+            for imt, curves in imt_curves:
+                if individual_curves:
+                    self.save_curves_for_rlz_imt(
+                        rlz, imt, imtls[imt], points, curves)
+                curves_by_imt[imt].append(curves)
+
+        self.curves = {}  # save memory for the post-processing phase
+        if self.mean_hazard_curves or self.quantile_hazard_curves:
+            self.curves_by_imt = curves_by_imt
+
+    def save_curves_for_rlz_imt(self, rlz, imt, imls, points, curves):
+        """
+        Save the curves corresponding to a given realization and IMT.
+
+        :param rlz: a LtRealization instance
+        :param imt: an IMT string
+        :param imls: the intensity measure levels for the given IMT
+        :param points: the points associated to the curves
+        :param curves: the curves
+        """
+        # create a new `HazardCurve` 'container' record for each
+        # realization for each intensity measure type
+        hc_im_type, sa_period, sa_damping = from_string(imt)
+
+        # save output
+        hco = models.Output.objects.create(
+            oq_job=self.job,
+            display_name="Hazard Curve rlz-%s-%s" % (rlz.id, imt),
+            output_type='hazard_curve',
+        )
+
+        # save hazard_curve
+        haz_curve = models.HazardCurve.objects.create(
+            output=hco,
+            lt_realization=rlz,
+            investigation_time=self.hc.investigation_time,
+            imt=hc_im_type,
+            imls=imls,
+            sa_period=sa_period,
+            sa_damping=sa_damping,
+        )
+
+        # save hazard_curve_data
+        logs.LOG.info('saving %d hazard curves for %s, imt=%s',
+                      len(points), hco, imt)
+        writer.CacheInserter.saveall([models.HazardCurveData(
+            hazard_curve=haz_curve,
+            poes=list(poes),
+            location=p.location,
+            weight=rlz.weight)
+            for p, poes in zip(points, curves)])
+
     @EnginePerformanceMonitor.monitor
     def do_aggregate_post_proc(self):
         """
@@ -452,15 +725,19 @@ class BaseHazardCalculator(base.Calculator):
 
         Post-processing results will be stored directly into the database.
         """
-        num_rlzs = models.LtRealization.objects.filter(
-            hazard_calculation=self.hc).count()
-
-        num_site_blocks_per_incr = int(CURVE_CACHE_SIZE) / int(num_rlzs)
-        if num_site_blocks_per_incr == 0:
-            # This means we have `num_rlzs` >= `CURVE_CACHE_SIZE`.
-            # The minimum number of sites should be 1.
-            num_site_blocks_per_incr = 1
-        slice_incr = num_site_blocks_per_incr * num_rlzs  # unit: num records
+        del self.source_collector  # save memory
+        weights = [rlz.weight for rlz in models.LtRealization.objects.filter(
+            lt_model__hazard_calculation=self.job)]
+        num_rlzs = len(weights)
+        if not num_rlzs:
+            logs.LOG.warn('No realizations for hazard_calculation_id=%d',
+                          self.job.id)
+            return
+        elif num_rlzs == 1 and self.quantile_hazard_curves:
+            logs.LOG.warn(
+                'There is only one realization, the configuration parameter '
+                'quantile_hazard_curves should not be set')
+            return
 
         if self.hc.mean_hazard_curves:
             # create a new `HazardCurve` 'container' record for mean
@@ -473,18 +750,17 @@ class BaseHazardCalculator(base.Calculator):
                 imt=None,
                 investigation_time=self.hc.investigation_time)
 
-        if self.hc.quantile_hazard_curves:
-            for quantile in self.hc.quantile_hazard_curves:
-                # create a new `HazardCurve` 'container' record for quantile
-                # curves (virtual container for multiple imts)
-                models.HazardCurve.objects.create(
-                    output=models.Output.objects.create_output(
-                        self.job, 'quantile(%s)-curves' % quantile,
-                        "hazard_curve_multi"),
-                    statistics="quantile",
-                    imt=None,
-                    quantile=quantile,
-                    investigation_time=self.hc.investigation_time)
+        for quantile in self.quantile_hazard_curves:
+            # create a new `HazardCurve` 'container' record for quantile
+            # curves (virtual container for multiple imts)
+            models.HazardCurve.objects.create(
+                output=models.Output.objects.create_output(
+                    self.job, 'quantile(%s)-curves' % quantile,
+                    "hazard_curve_multi"),
+                statistics="quantile",
+                imt=None,
+                quantile=quantile,
+                investigation_time=self.hc.investigation_time)
 
         for imt, imls in self.hc.intensity_measure_types_and_levels.items():
             im_type, sa_period, sa_damping = from_string(imt)
@@ -508,75 +784,96 @@ class BaseHazardCalculator(base.Calculator):
                 )
                 container_ids['mean'] = mean_hc.id
 
-            if self.hc.quantile_hazard_curves:
-                for quantile in self.hc.quantile_hazard_curves:
-                    q_output = models.Output.objects.create_output(
-                        job=self.job,
-                        display_name=(
-                            '%s quantile Hazard Curves %s' % (quantile, imt)
-                        ),
-                        output_type='hazard_curve'
+            for quantile in self.quantile_hazard_curves:
+                q_output = models.Output.objects.create_output(
+                    job=self.job,
+                    display_name=(
+                        '%s quantile Hazard Curves %s' % (quantile, imt)
+                    ),
+                    output_type='hazard_curve'
+                )
+                q_hc = models.HazardCurve.objects.create(
+                    output=q_output,
+                    investigation_time=self.hc.investigation_time,
+                    imt=im_type,
+                    imls=imls,
+                    sa_period=sa_period,
+                    sa_damping=sa_damping,
+                    statistics='quantile',
+                    quantile=quantile
+                )
+                container_ids['q%s' % quantile] = q_hc.id
+
+            # num_rlzs * num_sites * num_levels
+            # NB: different IMTs can have different num_levels
+            all_curves_for_imt = numpy.array(self.curves_by_imt[imt])
+            del self.curves_by_imt[imt]  # save memory
+
+            inserter = writer.CacheInserter(
+                models.HazardCurveData, max_cache_size=10000)
+
+            # curve_poes below is an array num_rlzs * num_levels
+            for i, site in enumerate(self.site_collection):
+                wkt = site.location.wkt2d
+                curve_poes = numpy.array(
+                    [c_by_rlz[i] for c_by_rlz in all_curves_for_imt])
+                # do means and quantiles
+                # quantiles first:
+                for quantile in self.quantile_hazard_curves:
+                    if self.hc.number_of_logic_tree_samples == 0:
+                        # explicitly weighted quantiles
+                        q_curve = weighted_quantile_curve(
+                            curve_poes, weights, quantile)
+                    else:
+                        # implicitly weighted quantiles
+                        q_curve = quantile_curve(
+                            curve_poes, quantile)
+                    inserter.add(
+                        models.HazardCurveData(
+                            hazard_curve_id=(
+                                container_ids['q%s' % quantile]),
+                            poes=q_curve.tolist(),
+                            location=wkt)
                     )
-                    q_hc = models.HazardCurve.objects.create(
-                        output=q_output,
-                        investigation_time=self.hc.investigation_time,
-                        imt=im_type,
-                        imls=imls,
-                        sa_period=sa_period,
-                        sa_damping=sa_damping,
-                        statistics='quantile',
-                        quantile=quantile
+
+                # then means
+                if self.mean_hazard_curves:
+                    m_curve = mean_curve(curve_poes, weights=weights)
+                    inserter.add(
+                        models.HazardCurveData(
+                            hazard_curve_id=container_ids['mean'],
+                            poes=m_curve.tolist(),
+                            location=wkt)
                     )
-                    container_ids['q%s' % quantile] = q_hc.id
+            inserter.flush()
 
-            all_curves_for_imt = models.order_by_location(
-                models.HazardCurveData.objects.all_curves_for_imt(
-                    self.job.id, im_type, sa_period, sa_damping))
+    def post_process(self):
+        """
+        Optionally generates aggregate curves, hazard maps and
+        uniform_hazard_spectra.
+        """
+        # means/quantiles:
+        if self.mean_hazard_curves or self.quantile_hazard_curves:
+            self.do_aggregate_post_proc()
 
-            with transaction.commit_on_success(using='job_init'):
-                inserter = writer.CacheInserter(
-                    models.HazardCurveData, CURVE_CACHE_SIZE)
+        # hazard maps:
+        # required for computing UHS
+        # if `hazard_maps` is false but `uniform_hazard_spectra` is true,
+        # just don't export the maps
+        if (getattr(self.hc, 'hazard_maps', None) or
+                getattr(self.hc, 'uniform_hazard_spectra', None)):
+            with self.monitor('generating hazard maps'):
+                hazard_curves = models.HazardCurve.objects.filter(
+                    output__oq_job=self.job, imt__isnull=False)
+                tasks.apply_reduce(
+                    hazard_curves_to_hazard_map,
+                    (self.job.id, hazard_curves, self.hc.poes))
 
-                for chunk in models.queryset_iter(all_curves_for_imt,
-                                                  slice_incr):
-                    # slice each chunk by `num_rlzs` into `site_chunk`
-                    # and compute the aggregate
-                    for site_chunk in block_splitter(chunk, num_rlzs):
-                        site = site_chunk[0].location
-                        curves_poes = [x.poes for x in site_chunk]
-                        curves_weights = [x.weight for x in site_chunk]
-
-                        # do means and quantiles
-                        # quantiles first:
-                        if self.hc.quantile_hazard_curves:
-                            for quantile in self.hc.quantile_hazard_curves:
-                                if self.hc.number_of_logic_tree_samples == 0:
-                                    # explicitly weighted quantiles
-                                    q_curve = weighted_quantile_curve(
-                                        curves_poes, curves_weights, quantile
-                                    )
-                                else:
-                                    # implicitly weighted quantiles
-                                    q_curve = quantile_curve(
-                                        curves_poes, quantile
-                                    )
-                                inserter.add(
-                                    models.HazardCurveData(
-                                        hazard_curve_id=(
-                                            container_ids['q%s' % quantile]),
-                                        poes=q_curve.tolist(),
-                                        location=site.wkt)
-                                )
-
-                        # then means
-                        if self.hc.mean_hazard_curves:
-                            m_curve = mean_curve(
-                                curves_poes, weights=curves_weights
-                            )
-                            inserter.add(
-                                models.HazardCurveData(
-                                    hazard_curve_id=container_ids['mean'],
-                                    poes=m_curve.tolist(),
-                                    location=site.wkt)
-                            )
-                inserter.flush()
+        if getattr(self.hc, 'uniform_hazard_spectra', None):
+            individual_curves = self.job.get_param(
+                'individual_curves', missing=True)
+            if individual_curves is False:
+                logs.LOG.warn('The parameter `individual_curves` is false, '
+                              'cannot compute the UHS curves')
+            else:
+                do_uhs_post_proc(self.job)

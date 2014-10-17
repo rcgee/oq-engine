@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2013, GEM Foundation.
+# Copyright (c) 2014, GEM Foundation.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -49,6 +49,7 @@ class ProgressHandler(logging.Handler):
         logging.Handler.__init__(self)
         self.callback_url = callback_url
         self.calc = calc
+        self.description = calc.get_param('description')
 
     def emit(self, record):
         """
@@ -57,10 +58,21 @@ class ProgressHandler(logging.Handler):
         update_calculation(
             self.callback_url,
             status=record.getMessage(),
-            description=self.calc.description)
+            description=self.description)
 
 
-def run_calc(job_type, calc_id, calc_dir,
+def safely_call(func, *args):
+    """
+    Call the given procedure with the given arguments safely, i.e.
+    by trapping the exceptions and logging them.
+    """
+    try:
+        func(*args)
+    except Exception as e:
+        logger.error(str(e), exc_info=True)
+
+
+def run_calc(job_type, job_id, calc_dir,
              callback_url=None, foreign_calc_id=None,
              dbname="platform", log_file=None):
     """
@@ -71,8 +83,8 @@ def run_calc(job_type, calc_id, calc_dir,
 
     :param job_type:
         'hazard' or 'risk'
-    :param calc_id:
-        the calculation id on the engine
+    :param job_id:
+        the ID of the job on the engine
     :param calc_dir:
         the directory with the input files
     :param callback_url:
@@ -82,16 +94,12 @@ def run_calc(job_type, calc_id, calc_dir,
     :param dbname:
         the platform database name
     """
-    if job_type == 'hazard':
-        job = oqe_models.OqJob.objects.get(hazard_calculation=calc_id)
-    else:
-        job = oqe_models.OqJob.objects.get(risk_calculation=calc_id)
-    update_calculation(callback_url, status="started", engine_id=calc_id)
+    job = oqe_models.OqJob.objects.get(pk=job_id)
+    update_calculation(callback_url, status="started", engine_id=job_id)
 
     exports = []
-    progress_handler = ProgressHandler(callback_url, job.calculation)
+    progress_handler = ProgressHandler(callback_url, job)
     logging.root.addHandler(progress_handler)
-
     try:
         engine.run_calc(job, DEFAULT_LOG_LEVEL, log_file, exports, job_type)
     except:  # catch the errors before task spawning
@@ -100,7 +108,6 @@ def run_calc(job_type, calc_id, calc_dir,
         einfo = ''.join(traceback.format_tb(tb))
         einfo += '%s: %s' % (exctype.__name__, exc)
         update_calculation(callback_url, status="failed", einfo=einfo)
-        return
     finally:
         logging.root.removeHandler(progress_handler)
 
@@ -127,14 +134,25 @@ def _trigger_migration(job, callback_url, foreign_calc_id, dbname="platform"):
         a key to extract database connection settings from settings.DATABASES
         in order to get a cursor from the platform database
     """
+    if not dbname in DATABASES:
+        logger.error('Unknow key %s in PLATFORM_DATABASES; '
+                     'you forgot to set local_settings.py' % dbname)
+        return
+    host = DATABASES[dbname]['HOST']
+    if host == 'localhost':
+        msg = ('Using localhost as database host; probably '
+               'you forgot to override PLATFORM_DATABASES in '
+               'local_settings.py ')
+        logger.error(msg)
+        return
 
     update_calculation(
         callback_url,
-        description=job.calculation.description,
+        description=job.get_param('description'),
         status="transfering outputs")
 
     platform_connection = psycopg2.connect(
-        host=DATABASES[dbname]['HOST'],
+        host=host,
         database=DATABASES[dbname]['NAME'],
         user=DATABASES[dbname]['USER'],
         password=DATABASES[dbname]['PASSWORD'],
@@ -155,10 +173,9 @@ def update_calculation(callback_url=None, **query):
     """
     if callback_url is None:
         return
-    try:  # post to an external service
-        url = urllib2.urlopen(callback_url, data=urllib.urlencode(query))
-    finally:
-        url.close()
+    # post to an external service
+    url = urllib2.urlopen(callback_url, data=urllib.urlencode(query))
+    url.close()
 
 
 #: Simple structure that holds all the query components needed to
@@ -197,8 +214,8 @@ DBINTERFACE = {
     'ses': DbInterface(
         """SELECT tag, magnitude, St_AsText(hypocenter)
            FROM hzrdr.ses_rupture r
-           JOIN hzrdr.ses ses ON ses.id = r.ses_id
-           JOIN hzrdr.ses_collection sc ON ses.ses_collection_id = sc.id
+           JOIN hzrdr.probabilistic_rupture pr ON r.id = r.rupture_id
+           JOIN hzrdr.ses_collection sc ON pr.ses_collection_id = sc.id
            JOIN uiapi.output o ON o.id = sc.output_id
            WHERE o.id = %(output_id)d""",
         "icebox_ses",
@@ -337,7 +354,7 @@ def copy_output(platform_connection, output, foreign_calculation_id):
                          ENCODING 'utf8', DELIMITER '|')""" % (
                 iface.export_query % {
                     'output_id': output.id,
-                    'calculation_id': output.oq_job.calculation.id}),
+                    'calculation_id': output.oq_job.calc_id}),
                 temporary_file)
 
             temporary_file.seek(0)

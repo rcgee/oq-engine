@@ -1,4 +1,4 @@
-# Copyright (c) 2013, GEM Foundation.
+# Copyright (c) 2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -34,23 +34,22 @@ class ScenarioDamageRiskCase4TestCase(risk.FixtureBasedQATestCase):
     def actual_data(self, job):
         per_asset = models.DmgDistPerAsset.objects.filter(
             dmg_state__risk_calculation=job.risk_calculation).order_by(
-                'exposure_data', 'dmg_state')
+            'exposure_data', 'dmg_state')
         totals = models.DmgDistTotal.objects.filter(
             dmg_state__risk_calculation=job.risk_calculation).order_by(
-                'dmg_state')
-        return [[[m.mean, m.stddev] for m in per_asset],
+            'dmg_state')
+        data = [[[m.mean, m.stddev] for m in per_asset],
                 [[total.mean, total.stddev] for total in totals]]
+        return data
 
     def expected_data(self):
-        return [[[2831.39440276538, 272.496770998072],
-                 [161.947302372973, 249.774966981951],
-                 [6.65829486164962, 29.46078616569],
-                 [160.845510534195, 260.559970809904],
-                 [428.273449106381, 290.835857759211],
-                 [410.881040359423, 378.302327897718],
-                 [516.766483950188, 646.868485847065],
-                 [777.664421126009, 535.83594187711],
-                 [705.569094923804, 743.547507821238]],
-                [[3509.00639724976, 741.459174207617],
-                 [1367.88517260537, 666.080418405019],
-                 [1123.10843014487, 836.390985994778]]]
+        return [
+            [[2665.92514738795, 385.408846601969], [320.924965874035, 363.274973366753],
+             [13.1498867380187, 23.8620047204362], [208.269578176731, 307.396726473713],
+             [533.674469271356, 177.190914484958], [258.055952551913, 251.576066029219],
+             [638.702514496033, 757.994603683792], [670.416600459505, 539.363527776893],
+             [690.880885044462, 883.18277798177]],
+            [[3512.89724006071, 1239.14198904676], [1525.0160356049, 685.895079593009],
+             [962.086724334393, 1051.8785015279]]]
+
+

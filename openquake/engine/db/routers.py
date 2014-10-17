@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -53,15 +53,7 @@ class OQRouter(object):
         Get the name of the correct db configuration to use for read operations
         on the given model.
         '''
-        schema = self._schema_table_from_model(model)[0]
-
-        if schema in ("admin",):
-            # The db name for these is the same as the schema
-            return schema
-        elif schema in ("hzrdr", "riskr", "htemp", "hzrdi", "riski", "uiapi"):
-            return "job_init"
-        else:
-            return '%s_read' % schema
+        return "job_init"
 
     def db_for_write(self, model, **_hints):
         '''
@@ -69,16 +61,10 @@ class OQRouter(object):
         operations on the given model.
         '''
         schema, table = self._schema_table_from_model(model)
-
-        if schema in ('admin',):
-            # The db name for these is the same as the schema
-            return schema
-        elif schema == "uiapi" and table == "output":
-            return "job_init"
-        elif schema in ("hzrdi", "riski", "uiapi", "hzrdr", "riskr", "htemp"):
+        if schema == "uiapi" and table == "output":
             return "job_init"
         else:
-            return '%s_write' % schema
+            return "job_init"
 
     def allow_relation(self, _obj1, _obj2, **_hints):  # pylint: disable=R0201
         '''

@@ -1,3 +1,4 @@
+import zipfile
 import json
 import mock
 import os
@@ -19,6 +20,10 @@ FakeOutput = namedtuple('FakeOutput', 'id, display_name, output_type')
 
 DATADIR = os.path.join(os.path.dirname(__file__), 'data')
 TMPDIR = tempfile.gettempdir()
+
+
+def write(archive, fname):
+    archive.write(os.path.join(DATADIR, fname), fname)
 
 
 class BaseViewTestCase(unittest.TestCase):
@@ -127,7 +132,7 @@ class CalcToResponseDataTestCase(unittest.TestCase):
         self.calc = mock.Mock()
         field_names = [
             'base_path', 'export_dir', 'owner',
-            'region', 'sites', 'region_constraint', 'sites_disagg',
+            'region', 'region_constraint',
             'hazard_calculation', 'hazard_output',
             'description', 'maximum_distance',
         ]
@@ -143,17 +148,9 @@ class CalcToResponseDataTestCase(unittest.TestCase):
             '{ "type": "Polygon", "coordinates": '
             '[[[1, 1], [2, 3], [3, 1], [1, 1]]] }'
         )
-        self.calc.sites.geojson = (
-            '{ "type": "MultiPoint", "coordinates": '
-            '[[100.0, 0.0], [101.0, 1.0]] }'
-        )
         self.calc.region_constraint.geojson = (
             '{ "type": "Polygon", "coordinates": '
             '[[[2, 2], [3, 4], [4, 1], [1, 1]]] }'
-        )
-        self.calc.sites_disagg.geojson = (
-            '{ "type": "MultiPoint", "coordinates": '
-            '[[100.1, 0.1], [101.1, 1.1]] }'
         )
 
         # risk inputs
@@ -176,14 +173,6 @@ class CalcToResponseDataTestCase(unittest.TestCase):
             'region_constraint': {
                 u'coordinates': [[[2, 2], [3, 4], [4, 1], [1, 1]]],
                 u'type': u'Polygon',
-            },
-            'sites': {
-                u'coordinates': [[100.0, 0.0], [101.0, 1.0]],
-                u'type': u'MultiPoint',
-            },
-            'sites_disagg': {
-                u'coordinates': [[100.1, 0.1], [101.1, 1.1]],
-                u'type': u'MultiPoint',
             },
         }
 
@@ -208,9 +197,9 @@ class CalcHazardResultsTestCase(BaseViewTestCase):
              'url': 'http://www.openquake.org/v1/calc/hazard/result/3'},
         ]
         with mock.patch('openquake.engine.engine.get_outputs') as gho:
-            with mock.patch('openquake.engine.db.models'
-                            '.HazardCalculation.objects.get') as hc_get:
-                hc_get.return_value.oqjob.status = 'complete'
+            with mock.patch('openquake.engine.db.models.OqJob.objects.get'
+                            ) as oqjob:
+                oqjob.return_value.status = 'complete'
                 gho.return_value = [
                     FakeOutput(1, 'output1', 'hazard_curve'),
                     FakeOutput(2, 'output2', 'hazard_curve'),
@@ -228,26 +217,24 @@ class CalcHazardResultsTestCase(BaseViewTestCase):
 
     def test_404_no_outputs(self):
         with mock.patch('openquake.engine.engine.get_outputs') as gho:
-            with mock.patch('openquake.engine.db.models'
-                            '.HazardCalculation.objects.get') as hc_get:
-                hc_get.return_value.oqjob.status = 'complete'
+            with mock.patch('openquake.engine.db.models.OqJob.objects.get'
+                            ) as oqjob:
+                oqjob.return_value.status = 'complete'
                 gho.return_value = []
                 response = views.calc_results(self.request, 'hazard', 7)
 
         self.assertEqual(404, response.status_code)
 
     def test_404_calc_not_exists(self):
-        with mock.patch('openquake.engine.db.models'
-                        '.HazardCalculation.objects.get') as hc_get:
-            hc_get.side_effect = ObjectDoesNotExist
+        with mock.patch('openquake.engine.db.models.OqJob') as oqjob:
+            oqjob.side_effect = ObjectDoesNotExist
             response = views.calc_results(self.request, 'hazard', 7)
 
         self.assertEqual(404, response.status_code)
 
     def test_404_calc_not_complete(self):
-        with mock.patch('openquake.engine.db.models'
-                        '.HazardCalculation.objects.get') as hc_get:
-            hc_get.return_value.oqjob.status = 'pre_executing'
+        with mock.patch('openquake.engine.db.models.OqJob') as oqjob:
+            oqjob.return_value.oqjob.status = 'pre_executing'
             response = views.calc_results(self.request, 'hazard', 7)
 
         self.assertEqual(404, response.status_code)
@@ -295,16 +282,16 @@ class CalcRiskResultsTestCase(BaseViewTestCase):
 
     def test_404_calc_not_exists(self):
         with mock.patch('openquake.engine.db.models'
-                        '.RiskCalculation.objects.get') as hc_get:
-            hc_get.side_effect = ObjectDoesNotExist
+                        '.RiskCalculation.objects.get') as rc_get:
+            rc_get.side_effect = ObjectDoesNotExist
             response = views.calc_results(self.request, 'risk', 1)
 
         self.assertEqual(404, response.status_code)
 
     def test_404_calc_not_complete(self):
         with mock.patch('openquake.engine.db.models'
-                        '.RiskCalculation.objects.get') as hc_get:
-            hc_get.return_value.oqjob.status = 'pre_executing'
+                        '.RiskCalculation.objects.get') as rc_get:
+            rc_get.return_value.oqjob.status = 'pre_executing'
             response = views.calc_results(self.request, 'risk', 1)
 
         self.assertEqual(404, response.status_code)
@@ -484,10 +471,12 @@ class FakeTempUploadedFile(object):
 
 FakeUser = namedtuple('FakeUser', 'id')
 FakeJob = namedtuple(
-    'FakeJob', 'status, owner, hazard_calculation, risk_calculation'
+    'FakeJob', 'id, status, owner, hazard_calculation, risk_calculation'
 )
-FakeJob.calculation = property(
-    lambda self: self.risk_calculation or self.hazard_calculation)
+FakeJob.calc_id = property(
+    lambda self: (self.risk_calculation or self).id)
+FakeJob.job_type = property(
+    lambda self: 'risk' if self.risk_calculation else 'hazard')
 
 FakeCalc = namedtuple('FakeCalc', 'id, description')
 
@@ -499,7 +488,7 @@ class RunCalcTestCase(BaseViewTestCase):
         self.request.user.username = 'openquake'
         self.request.method = 'POST'
         self.request.POST = dict(database="platform")
-        self.request.POST['hazard_calculation_id'] = 666
+        self.request.POST['hazard_job_id'] = 666
         self.request.META = dict()
         self.request.META['HTTP_HOST'] = 'www.openquake.org'
         self.executor_call_data = dict(count=0, args=None)
@@ -514,35 +503,34 @@ class RunCalcTestCase(BaseViewTestCase):
         executor.submit = self.executor_submit
 
     def test(self):
-        # Test job file inputs:
-        fake_job_file = FakeTempUploadedFile('/foo/bar/tmpHfJv16tmp.upload',
-                                             'job.ini')
-        fake_model_1 = FakeTempUploadedFile('/foo/bar/tmpHmcdv2tmp.upload',
-                                            'vulnerability.xml')
-        fake_model_2 = FakeTempUploadedFile('/foo/bar/tmpI66zIGtmp.upload',
-                                            'exposure.xml')
+        # prepare an archive with the test files
+        if os.path.exists('archive.zip'):
+            os.remove('archive.zip')
+        archive = zipfile.ZipFile('archive.zip', 'w')
+        write(archive, 'job.ini')
+        write(archive, 'exposure_model.xml')
+        write(archive, 'source_model.xml')
+        write(archive, 'source_model_logic_tree.xml')
+        write(archive, 'gsim_logic_tree.xml')
+        write(archive, 'vulnerability_model.xml')
+        archive.close()
+
+        archive_file = open('archive.zip')
         self.request.FILES = MultiValueDict({
-            'job_config': [fake_job_file, fake_model_1, fake_model_2]})
+            'archive': [archive_file]})
 
         # Set up the mocks:
         mocks = dict(
             mkdtemp='tempfile.mkdtemp',
-            move='shutil.move',
             job_from_file='openquake.engine.engine.job_from_file',
-            run_task='openquake.server.tasks.run_calc',
+            run_calc='openquake.server.tasks.run_calc',
         )
         multi_mock = MultiMock(**mocks)
 
         temp_dir = tempfile.mkdtemp()
 
-        # Set up expected test values:
-        pathjoin = os.path.join
-        move_exp_call_args = [
-            ((fake_job_file.path, pathjoin(temp_dir, fake_job_file.name)), {}),
-            ((fake_model_1.path, pathjoin(temp_dir, fake_model_1.name)), {}),
-            ((fake_model_2.path, pathjoin(temp_dir, fake_model_2.name)), {}),
-        ]
-        jff_exp_call_args = ((pathjoin(temp_dir, fake_job_file.name),
+        # Set up expected test values for job_from_file:
+        jff_exp_call_args = ((os.path.join(temp_dir, 'job.ini'),
                               'platform', 'progress',  [], None, 666), {})
 
         try:
@@ -550,7 +538,7 @@ class RunCalcTestCase(BaseViewTestCase):
                 multi_mock['mkdtemp'].return_value = temp_dir
 
                 fake_job = FakeJob(
-                    'pending', FakeUser(1), None,
+                    777, 'pending', FakeUser(1), None,
                     FakeCalc(777, 'Fake Calc Desc'),
                 )
                 multi_mock['job_from_file'].return_value = fake_job
@@ -560,20 +548,18 @@ class RunCalcTestCase(BaseViewTestCase):
 
             self.assertEqual(1, multi_mock['mkdtemp'].call_count)
 
-            self.assertEqual(3, multi_mock['move'].call_count)
-            self.assertEqual(move_exp_call_args,
-                             multi_mock['move'].call_args_list)
-
             self.assertEqual(1, multi_mock['job_from_file'].call_count)
             self.assertEqual(jff_exp_call_args,
                              multi_mock['job_from_file'].call_args)
 
             self.assertEqual({
                 'count': 1,
-                'args': (('risk', 777, temp_dir, None, None, 'platform', None),
+                'args': ((multi_mock['run_calc'],
+                          'risk', 777, temp_dir, None, None, 'platform', None),
                          {})
                 }, self.executor_call_data)
         finally:
+            archive_file.close()
             shutil.rmtree(temp_dir)
 
 
@@ -595,11 +581,11 @@ class SubmitJobTestCase(unittest.TestCase):
         self.nd.stop()
         self.uc.stop()
 
-    def run_job(self, job_ini, hazard_calculation_id=None):
+    def run_job(self, job_ini, hazard_job_id=None):
         cfg_file = os.path.join(DATADIR, job_ini)
         job, future = views.submit_job(
             cfg_file, DATADIR, 'openquake',
-            hazard_calculation_id=hazard_calculation_id,
+            hazard_job_id=hazard_job_id,
             logfile=os.path.join(TMPDIR, 'server_tests.log'))
         future.result()  # wait
         return job
@@ -611,7 +597,7 @@ class SubmitJobTestCase(unittest.TestCase):
             'status': '**  complete (hazard)',
             'description': u'Virtual Island Seismic Hazard, ses=5'})
 
-        self.run_job('job_risk.ini', job.hazard_calculation.id)
+        self.run_job('job_risk.ini', job.id)
         args, kw = tasks.update_calculation.call_args
         self.assertEqual(kw, {
             'status': '**  complete (risk)',
@@ -629,7 +615,7 @@ class SubmitJobTestCase(unittest.TestCase):
         # the error here is to use a function instead of an oqtask
         p = mock.patch(
             'openquake.engine.calculators.hazard.event_based.core.'
-            'compute_ses_and_gmfs', lambda *args: None)
+            'compute_ruptures', lambda *args: None)
         with p:
             self.run_job('job.ini')
         args, kw = tasks.update_calculation.call_args

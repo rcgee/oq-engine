@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -27,8 +27,8 @@ class ScenarioHazardCase5TestCase(qa_utils.BaseQATestCase):
     def test(self):
         cfg = os.path.join(os.path.dirname(__file__), 'job.ini')
         job = self.run_hazard(cfg)
-        [output] = export.core.get_outputs(job.id)
-        gmfs = list(models.get_gmvs_per_site(output, 'PGA', sort=lambda x: x))
+        [output] = export.core.get_outputs(job.id, 'gmf_scenario')
+        gmfs = list(models.get_gmvs_per_site(output, 'PGA'))
         realizations = 1e5
         first_value = 0.5
         second_value = 1.0

@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -77,7 +77,7 @@ class ClassicalHazardCase11TestCase(qa_utils.BaseQATestCase):
       <gml:Point>
         <gml:pos>0.0 0.0</gml:pos>
       </gml:Point>
-      <poEs>0.0106744601702 0.000803487930336 9.71146367725e-05 0.0</poEs>
+      <poEs>0.0106744601702 0.000803487930335 9.71146367726e-05 0.0</poEs>
     </hazardCurve>
   </hazardCurves>
 </nrml>"""
@@ -129,11 +129,12 @@ class ClassicalHazardCase11TestCase(qa_utils.BaseQATestCase):
             job = self.run_hazard(cfg)
 
             # Test the poe values for the two curves:
-            curve_b1_b2, curve_b1_b3, curve_b1_b4 = \
-                models.HazardCurveData.objects\
-                    .filter(hazard_curve__output__oq_job=job.id,
-                            hazard_curve__lt_realization__isnull=False)\
-                    .order_by('hazard_curve__lt_realization__sm_lt_path')
+            curve_b1_b2, curve_b1_b3, curve_b1_b4 = (
+                models.HazardCurveData.objects
+                .filter(hazard_curve__output__oq_job=job.id,
+                        hazard_curve__lt_realization__isnull=False)
+                .order_by(
+                    'hazard_curve__lt_realization__lt_model__sm_lt_path'))
 
             # Sanity check, to make sure we have the curves ordered correctly:
             self.assertEqual(

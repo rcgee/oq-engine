@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2013, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -23,10 +23,11 @@ from collections import namedtuple
 from lxml import etree
 from nose.plugins.attrib import attr
 
+from openquake.commonlib import nrml
+
 from openquake.engine.db import models
 from openquake.engine.export import core as export_core
 from openquake.engine.export import hazard
-from openquake import nrmllib
 
 from openquake.engine.tests.export.core_test import \
     BaseExportTestCase, number_of
@@ -36,10 +37,9 @@ from openquake.engine.tests.utils import helpers
 def check_export(output_id, target):
     """
     Call hazard.export by checking that the exported file is valid
-    according to our XML schema.
     """
     out_file = hazard.export(output_id, target, 'xml')
-    nrmllib.assert_valid(out_file)
+    nrml.read(out_file)
     return out_file
 
 
@@ -70,7 +70,7 @@ class GetResultExportDestTestCase(unittest.TestCase):
         )
         self.FakeSES = namedtuple(
             'SES',
-            'output, ordinal, sm_lt_path, weight'
+            'output, ordinal, sm_lt_path'
         )
         self.FakeOutput = namedtuple(
             'Output',
@@ -241,9 +241,9 @@ class GetResultExportDestTestCase(unittest.TestCase):
     def test_ses(self):
         output = self.FakeOutput('ses')
 
-        ses = self.FakeSES(output, 1, self.ltr_mc.sm_lt_path, None)
+        ses = self.FakeSES(output, 1, self.ltr_mc.sm_lt_path)
         expected_path = (
-            '%s/calc_8/ses/ses-smltp_B1_B3-ltr_1.xml'
+            '%s/calc_8/ses/ses-smltp_B1_B3.xml'
             % self.target_dir
         )
         self.assertEqual(
@@ -341,13 +341,23 @@ class ClassicalExportTestCase(BaseExportTestCase):
 
 
 class EventBasedExportTestCase(BaseExportTestCase):
+    expected_gmfs = 'expected_gmfset_1.txt', 'expected_gmfset_2.txt'
+
+    def check_file_content(self, fname, content):
+        fullname = os.path.join(os.path.dirname(__file__), fname)
+        with open(fullname + '.actual', 'w') as actual:
+            actual.write(content)
+        expected_content = open(fullname).read().rstrip()  # strip newline
+        self.assertEqual(expected_content, content)
+        # remove the .actual file if the test pass
+        os.remove(fullname + '.actual')
 
     @attr('slow')
     def test_export_for_event_based(self):
         # Run an event-based hazard calculation to compute SESs and GMFs
         # Call the exporters for both SES and GMF results  and verify that
         # files were created
-        # Since the XML writers (in `openquake.nrmllib.writers`) are concerned
+        # Since the XML writers (in `openquake.commonlib`) are concerned
         # with correctly generating the XML, we don't test that here...
         # but we should still have an end-to-end QA test.
         target_dir = tempfile.mkdtemp()
@@ -356,22 +366,15 @@ class EventBasedExportTestCase(BaseExportTestCase):
             cfg = helpers.get_data_path('event_based_hazard/job.ini')
 
             # run the calculation in process to create something to export
-            os.environ['OQ_NO_DISTRIBUTE'] = '1'
-            try:
-                job = helpers.run_job(cfg)
-            finally:
-                del os.environ['OQ_NO_DISTRIBUTE']
+            with mock.patch.dict(os.environ, {'OQ_NO_DISTRIBUTE': '1'}):
+                job = helpers.run_job(cfg, maximum_distance=1,
+                                      ses_per_logic_tree_path=1).job
             self.assertEqual(job.status, 'complete')
 
             outputs = export_core.get_outputs(job.id)
             # 2 GMFs, 1 SES,
             # ((2 imts * 2 realizations)
-            # + ((2 imts + 1 multi) * (1 mean + 3 quantiles))
-            # hazard curves,
-            # (2 poes * 2 imts * 2 realizations)
-            # + (2 poes * 2 imts * (1 mean + 3 quantiles)) hazard maps
-            # Total: 41
-            self.assertEqual(43, len(outputs))
+            self.assertEqual(45, len(outputs))
 
             #######
             # SESs:
@@ -404,6 +407,12 @@ class EventBasedExportTestCase(BaseExportTestCase):
             for f in exported_files:
                 self._test_exported_file(f)
 
+            # check the exact values of the GMFs
+            [gmfset1] = gmf_outputs[0].gmf
+            [gmfset2] = gmf_outputs[1].gmf
+            self.check_file_content('expected_gmfset_1.txt', str(gmfset1))
+            self.check_file_content('expected_gmfset_2.txt', str(gmfset2))
+
             ################
             # Hazard curves:
             haz_curves = outputs.filter(output_type='hazard_curve')
@@ -431,19 +440,15 @@ class ScenarioExportTestCase(BaseExportTestCase):
 
         try:
             cfg = helpers.get_data_path('scenario_hazard/job.ini')
-
             # run the calculation in process to create something to export
-            os.environ['OQ_NO_DISTRIBUTE'] = '1'
-            try:
+            with mock.patch.dict(os.environ, {'OQ_NO_DISTRIBUTE': '1'}):
                 helpers.run_job(cfg)
-            finally:
-                del os.environ['OQ_NO_DISTRIBUTE']
             job = models.OqJob.objects.latest('id')
             self.assertEqual(job.status, 'complete')
 
             outputs = export_core.get_outputs(job.id)
 
-            self.assertEqual(1, len(outputs))  # 1 GMF
+            self.assertEqual(2, len(outputs))  # 1 GMF, 1 SES
 
             gmf_outputs = outputs.filter(output_type='gmf_scenario')
             self.assertEqual(1, len(gmf_outputs))
@@ -515,14 +520,14 @@ class Bug1202290TestCase(unittest.TestCase):
 
     def test(self):
         output = mock.Mock()
-        output.oq_job.hazard_calculation.id = 1202290
+        output.oq_job.id = 1202290
         output.hazard_curve = mock.Mock()
         output.hazard_curve.__iter__ = lambda x: iter([])
         target = mock.Mock()
 
         with mock.patch('openquake.engine.export.hazard'
                         '._get_result_export_dest') as gred:
-            with mock.patch('openquake.nrmllib.hazard.writers'
+            with mock.patch('openquake.commonlib.hazard_writers'
                             '.MultiHazardCurveXMLWriter') as mhcxw:
                 mhcxw.return_value
                 mhcxw.serialize = mock.Mock()

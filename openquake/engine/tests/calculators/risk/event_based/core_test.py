@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -18,7 +18,8 @@ from openquake.engine.tests.utils.helpers import get_data_path
 from openquake.engine.tests.calculators.risk import base_test
 
 from openquake.engine.db import models
-from openquake.engine.calculators.risk.event_based import core as event_based
+from openquake.engine.calculators.risk.event_based_risk \
+    import core as event_based
 
 
 class EventBasedRiskCalculatorTestCase(base_test.BaseRiskCalculatorTestCase):
@@ -32,8 +33,9 @@ class EventBasedRiskCalculatorTestCase(base_test.BaseRiskCalculatorTestCase):
 
         self.calculator = event_based.EventBasedRiskCalculator(self.job)
         models.JobStats.objects.create(oq_job=self.job)
-        self.calculator.pre_execute()
         self.job.is_running = True
+        self.job.save()
+        self.calculator.pre_execute()
         self.job.status = 'executing'
         self.job.save()
 
@@ -44,30 +46,6 @@ class EventBasedRiskCalculatorTestCase(base_test.BaseRiskCalculatorTestCase):
 
         self.assertEqual([0.1, 0.2, 0.3], params.conditional_loss_poes)
         self.assertTrue(params.insured_losses)
-
-    def test_celery_task(self):
-        # Test that the celery task when called properly call the
-        # specific method to write loss curves
-
-        base_path = 'openquake.engine.calculators.risk.writers'
-        patches = [
-            helpers.patch('%s.loss_curve' % base_path),
-            helpers.patch('%s.event_loss_curve' % base_path)]
-
-        try:
-            mocked_loss_writer, mocked_event_loss_writer = [
-                p.start() for p in patches]
-
-            event_based.event_based(
-                *self.calculator.task_arg_gen().next())
-
-            # we expect 1 asset being filtered out by the region
-            # constraint, so there are only four loss curves (2 of them
-            # are insured) to be written
-            self.assertEqual(0, mocked_loss_writer.call_count)
-            self.assertEqual(2, mocked_event_loss_writer.call_count)
-        finally:
-            [p.stop() for p in patches]
 
     def test_complete_workflow(self):
         # Test the complete risk classical calculation workflow and test

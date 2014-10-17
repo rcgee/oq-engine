@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# packager.sh  Copyright (c) 2013, GEM Foundation.
+# packager.sh  Copyright (c) 2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -35,18 +35,26 @@
 #
 
 # export PS4='+${BASH_SOURCE}:${LINENO}:${FUNCNAME[0]}: '
-# set -x
+if [ $GEM_SET_DEBUG ]; then
+    set -x
+fi
 set -e
 GEM_GIT_REPO="git://github.com/gem"
 GEM_GIT_PACKAGE="oq-engine"
-GEM_GIT_DEPS="oq-nrmllib oq-hazardlib oq-risklib"
+GEM_GIT_DEPS="oq-hazardlib oq-risklib oq-commonlib"
 GEM_DEB_PACKAGE="python-${GEM_GIT_PACKAGE}"
 GEM_DEB_SERIE="master"
 if [ -z "$GEM_DEB_REPO" ]; then
     GEM_DEB_REPO="$HOME/gem_ubuntu_repo"
 fi
+if [ -z "$GEM_DEB_MONOTONE" ]; then
+    GEM_DEB_MONOTONE="$HOME/monotone"
+fi
+
 GEM_BUILD_ROOT="build-deb"
 GEM_BUILD_SRC="${GEM_BUILD_ROOT}/${GEM_DEB_PACKAGE}"
+
+GEM_MAXLOOP=20
 
 GEM_ALWAYS_YES=false
 
@@ -70,6 +78,7 @@ sig_hand () {
     echo "signal trapped"
     if [ "$lxc_name" != "" ]; then
         set +e
+        scp "${lxc_ip}:/var/tmp/openquake-db-installation" openquake-db-installation
         scp "${lxc_ip}:/tmp/celeryd.log" celeryd.log
         scp "${lxc_ip}:ssh.log" ssh.history
         echo "Destroying [$lxc_name] lxc"
@@ -97,6 +106,7 @@ sig_hand () {
         rm /tmp/packager.eph.$$.log
     fi
 }
+
 
 #
 #  dep2var <dep> - converts in a proper way the name of a dependency to a variable name
@@ -160,7 +170,8 @@ usage () {
 
     echo
     echo "USAGE:"
-    echo "    $0 [-D|--development] [-B|--binaries] [-U|--unsigned] [-R|--repository]    build debian source package."
+    echo "    $0 [-D|--development] [-S--sources_copy] [-B|--binaries] [-U|--unsigned] [-R|--repository]    build debian source package."
+    echo "       if -S is present try to copy sources to <GEM_DEB_MONOTONE>/source directory"
     echo "       if -B is present binary package is build too."
     echo "       if -R is present update the local repository to the new current package"
     echo "       if -D is present a package with self-computed version is produced."
@@ -198,12 +209,12 @@ _wait_ssh () {
 #
 #  _devtest_innervm_run <branch_id> <lxc_ip> - part of source test performed on lxc
 #                     the following activities are performed:
-#                     - extracts dependencies from oq-{engine,nrmlib, ..} debian/control
+#                     - extracts dependencies from oq-{engine,hazardlib, ..} debian/control
 #                       files and install them
 #                     - builds oq-hazardlib speedups
 #                     - installs oq-engine sources on lxc
 #                     - set up postgres
-#                     - creates database schema
+#                     - upgrade db
 #                     - runs celeryd
 #                     - runs tests
 #                     - runs coverage
@@ -264,7 +275,6 @@ _devtest_innervm_run () {
     git archive --prefix ${GEM_GIT_PACKAGE}/ HEAD | ssh $lxc_ip "tar xv"
 
     # configure the machine to run tests
-    ssh $lxc_ip "echo \"local   all             \$USER          trust\" | sudo tee -a /etc/postgresql/9.1/main/pg_hba.conf"
     ssh $lxc_ip "set -e
         for dbu in oq_job_init oq_admin; do
             sudo sed -i \"1ilocal   openquake   \$dbu                   md5\" /etc/postgresql/9.1/main/pg_hba.conf
@@ -273,25 +283,40 @@ _devtest_innervm_run () {
     ssh $lxc_ip "sudo sed -i 's/#standard_conforming_strings = on/standard_conforming_strings = off/g' /etc/postgresql/9.1/main/postgresql.conf"
 
     ssh $lxc_ip "sudo service postgresql restart"
-    ssh $lxc_ip "sudo -u postgres  createuser -d -e -i -l -s -w \$USER"
-
-    ssh $lxc_ip "sudo su postgres -c \"cd oq-engine ; openquake/engine/bin/oq_create_db --yes --db-user=\\\$USER --db-name=openquake --schema-path=\\\$(pwd)/openquake/engine/db/schema\""
-
-    for dbu in oq_admin oq_job_init; do
-        ssh $lxc_ip "sudo su postgres -c \"psql -c \\\"ALTER ROLE $dbu WITH PASSWORD 'openquake'\\\"\""
-    done
+    ssh $lxc_ip "set -e ; sudo su postgres -c \"cd oq-engine ; openquake/engine/bin/oq_create_db --yes --db-name=openquake2\""
+    ssh $lxc_ip "set -e ; export PYTHONPATH=\"\$PWD/oq-engine:\$PWD/oq-hazardlib:\$PWD/oq-risklib:\$PWD/oq-commonlib\" ; cd oq-engine ; bin/oq-engine --upgrade-db --yes"
 
     # run celeryd daemon
-    ssh $lxc_ip "export PYTHONPATH=\"\$PWD/oq-engine:\$PWD/oq-nrmllib:\$PWD/oq-hazardlib:\$PWD/oq-risklib\" ; cd oq-engine ; celeryd >/tmp/celeryd.log 2>&1 3>&1 &"
+    ssh $lxc_ip "export PYTHONPATH=\"\$PWD/oq-engine:\$PWD/oq-hazardlib:\$PWD/oq-risklib:\$PWD/oq-commonlib\" ; cd oq-engine ; celeryd >/tmp/celeryd.log 2>&1 3>&1 &"
 
     if [ -z "$GEM_DEVTEST_SKIP_TESTS" ]; then
         # wait for celeryd startup time
-        sleep 5
+        ssh $lxc_ip "
+celeryd_wait() {
+    local cw_nloop=\"\$1\" cw_ret cw_i
+
+    for cw_i in \$(seq 1 \$cw_nloop); do
+        cw_ret=\"\$(celeryctl status)\"
+        if echo \"\$cw_ret\" | grep -iq '^error:'; then
+            if echo \"\$cw_ret\" | grep -ivq '^error: no nodes replied'; then
+                return 1
+            fi
+        else
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+celeryd_wait $GEM_MAXLOOP"
+
         # run tests (in this case we omit 'set -e' to be able to read all tests outputs)
-        ssh $lxc_ip "export PYTHONPATH=\"\$PWD/oq-engine:\$PWD/oq-nrmllib:\$PWD/oq-hazardlib:\$PWD/oq-risklib\" ;
+        ssh $lxc_ip "export PYTHONPATH=\"\$PWD/oq-engine:\$PWD/oq-hazardlib:\$PWD/oq-risklib:\$PWD/oq-commonlib\" ;
                  cd oq-engine
-                 nosetests -v --with-xunit --with-coverage --cover-package=openquake.server --with-doctest openquake/server/tests/
-                 nosetests -v --with-xunit --with-coverage --cover-package=openquake.engine --with-doctest openquake/engine/tests/
+                 nosetests -v --with-xunit --xunit-file=xunit-server.xml --with-coverage --cover-package=openquake.server --with-doctest openquake/server/tests/
+                 nosetests -v --with-xunit --xunit-file=xunit-engine.xml --with-coverage --cover-package=openquake.engine --with-doctest openquake/engine/tests/
 
                  # OQ Engine QA tests (splitted into multiple execution to track the performance)
                  nosetests  -a 'qa,hazard,classical' -v --with-xunit --xunit-file=xunit-qa-hazard-classical.xml
@@ -309,8 +334,7 @@ _devtest_innervm_run () {
                  python-coverage xml --include=\"openquake/*\"
                 "
 
-        scp "${lxc_ip}:oq-engine/nosetests.xml" .
-        scp "${lxc_ip}:oq-engine/xunit-qa*.xml" .
+        scp "${lxc_ip}:oq-engine/xunit-*.xml" .
         scp "${lxc_ip}:oq-engine/coverage.xml" .
     else
         if [ -d $HOME/fake-data/oq-engine ]; then
@@ -334,7 +358,7 @@ _devtest_innervm_run () {
 #                     - adds repositories to apt sources on lxc
 #                     - performs package tests (install, remove, reinstall ..)
 #                     - set up postgres
-#                     - creates database schema
+#                     - upgrade db
 #                     - runs celeryd
 #                     - executes demos
 #
@@ -404,12 +428,11 @@ _pkgtest_innervm_run () {
     ssh $lxc_ip "sudo apt-get install --reinstall -y ${GEM_DEB_PACKAGE}"
 
     # configure the machine to run tests
-    ssh $lxc_ip "echo \"local   all             \$USER          trust\" | sudo tee -a /etc/postgresql/9.1/main/pg_hba.conf"
     ssh $lxc_ip "sudo sed -i 's/#standard_conforming_strings = on/standard_conforming_strings = off/g' /etc/postgresql/9.1/main/postgresql.conf"
 
     ssh $lxc_ip "sudo service postgresql restart"
-    ssh $lxc_ip "sudo -u postgres  createuser -d -e -i -l -s -w \$USER"
-    ssh $lxc_ip "oq_create_db --yes --db-user=\$USER --db-name=openquake --no-tab-spaces --schema-path=/usr/share/pyshared/openquake/engine/db/schema"
+    # XXX: should the --upgrade-db command go in the postint script?
+    ssh $lxc_ip "set -e; oq-engine --upgrade-db --yes"
 
     # run celeryd daemon
     ssh $lxc_ip "cd /usr/openquake/engine ; celeryd >/tmp/celeryd.log 2>&1 3>&1 &"
@@ -422,15 +445,30 @@ _pkgtest_innervm_run () {
         ssh $lxc_ip "set -e ; cd demos
         for ini in \$(find ./hazard -name job.ini | sort); do
             echo \"Running \$ini\"
-            openquake --run-hazard  \$ini --exports xml -l info
+            for loop in \$(seq 1 $GEM_MAXLOOP); do
+                set +e
+                oq-engine --run-hazard  \$ini --exports xml -l info
+                oq_ret=\$?
+                set -e
+                if [ \$oq_ret -eq 0 ]; then
+                    break
+                elif [ \$oq_ret -ne 2 ]; then
+                    exit \$oq_ret
+                fi
+                sleep 1
+            done
+            if [ \$loop -eq $GEM_MAXLOOP ]; then
+                exit \$oq_ret
+            fi
         done
 
         for demo_dir in \$(find ./risk  -mindepth 1 -maxdepth 1 -type d | sort); do
             cd \$demo_dir
-            echo \"Running demo in \$demo_dir\"
-            openquake --run-hazard job_hazard.ini -l info
-            calculation_id=\$(openquake --list-hazard-calculations | tail -1 | awk '{print \$1}')
-            openquake --run-risk job_risk.ini --exports xml --hazard-calculation-id \$calculation_id
+            echo \"Running \$demo_dir/job_hazard.ini\"
+            oq-engine --run-hazard job_hazard.ini -l info
+            job_id=\$(oq-engine --list-hazard-calculations | tail -1 | awk '{print \$1}')
+            echo \"Running \$demo_dir/job_risk.ini\"
+            oq-engine --run-risk job_risk.ini --exports xml --hazard-calculation-id \$job_id -l info
             cd -
         done"
     fi
@@ -593,6 +631,7 @@ devtest_run () {
     _devtest_innervm_run "$branch_id" "$lxc_ip"
     inner_ret=$?
 
+    scp "${lxc_ip}:/var/tmp/openquake-db-installation" openquake-db-installation.dev || true
     scp "${lxc_ip}:/tmp/celeryd.log" celeryd.log
     scp "${lxc_ip}:ssh.log" devtest.history
 
@@ -666,6 +705,7 @@ EOF
     _pkgtest_innervm_run $lxc_ip
     inner_ret=$?
 
+    scp "${lxc_ip}:/var/tmp/openquake-db-installation" openquake-db-installation.pkg || true
     scp "${lxc_ip}:/tmp/celeryd.log" celeryd.log
     scp "${lxc_ip}:ssh.log" pkgtest.history
 
@@ -693,6 +733,20 @@ EOF
         fi
         mkdir -p "${GEM_DEB_REPO}/${GEM_DEB_SERIE}"
         repo_tmpdir="$(mktemp -d "${GEM_DEB_REPO}/${GEM_DEB_SERIE}/${GEM_DEB_PACKAGE}.XXXXXX")"
+
+        # if the monotone directory exists and is the "gem" repo and is the "master" branch then ...
+        if [ -d "${GEM_DEB_MONOTONE}/binary" ]; then
+            if [ "git://$repo_id" == "$GEM_GIT_REPO" -a "$branch_id" == "master" ]; then
+                cp build-deb/${GEM_DEB_PACKAGE}_*.deb build-deb/${GEM_DEB_PACKAGE}_*.changes \
+                    build-deb/${GEM_DEB_PACKAGE}_*.dsc build-deb/${GEM_DEB_PACKAGE}_*.tar.gz \
+                    "${GEM_DEB_MONOTONE}/binary"
+                PKG_COMMIT="$(git rev-parse HEAD | cut -c 1-7)"
+                grep '_COMMIT' _jenkins_deps_info \
+                  | sed 's/\(^.*=[0-9a-f]\{7\}\).*/\1/g' \
+                  > "${GEM_DEB_MONOTONE}"/${GEM_DEB_PACKAGE}_${PKG_COMMIT}_deps.txt
+            fi
+        fi
+
         cp build-deb/${GEM_DEB_PACKAGE}_*.deb build-deb/${GEM_DEB_PACKAGE}_*.changes \
             build-deb/${GEM_DEB_PACKAGE}_*.dsc build-deb/${GEM_DEB_PACKAGE}_*.tar.gz \
             build-deb/Packages* build-deb/Sources* build-deb/Release* "${repo_tmpdir}"
@@ -709,6 +763,7 @@ EOF
 #
 #  MAIN
 #
+BUILD_SOURCES_COPY=0
 BUILD_BINARIES=0
 BUILD_REPOSITORY=0
 BUILD_DEVEL=0
@@ -728,6 +783,9 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             ;;
+        -S|--sources_copy)
+            BUILD_SOURCES_COPY=1
+            ;;
         -B|--binaries)
             BUILD_BINARIES=1
             ;;
@@ -742,12 +800,14 @@ while [ $# -gt 0 ]; do
             break
             ;;
         devtest)
-            devtest_run $2
+            # Sed removes 'origin/' from the branch name
+            devtest_run $(echo "$2" | sed 's@.*/@@g')
             exit $?
             break
             ;;
         pkgtest)
-            pkgtest_run $2
+            # Sed removes 'origin/' from the branch name
+            pkgtest_run $(echo "$2" | sed 's@.*/@@g')
             exit $?
             break
             ;;
@@ -784,14 +844,6 @@ cd "$GEM_BUILD_SRC"
 
 # date
 dt="$(date +%s)"
-
-# version from setup.py
-stp_vers="$(cat setup.py | sed -n "s/^version[  ]*=[    ]*['\"]\([^'\"]\+\)['\"].*/\1/gp")"
-stp_maj="$(echo "$stp_vers" | sed -n 's/^\([0-9]\+\).*/\1/gp')"
-stp_min="$(echo "$stp_vers" | sed -n 's/^[0-9]\+\.\([0-9]\+\).*/\1/gp')"
-stp_bfx="$(echo "$stp_vers" | sed -n 's/^[0-9]\+\.[0-9]\+\.\([0-9]\+\).*/\1/gp')"
-stp_suf="$(echo "$stp_vers" | sed -n 's/^[0-9]\+\.[0-9]\+\.[0-9]\+\(.*\)/\1/gp')"
-# echo "stp [$stp_vers] [$stp_maj] [$stp_min] [$stp_bfx] [$stp_suf]"
 
 # version info from openquake/engine/__init__.py
 ini_vers="$(cat openquake/engine/__init__.py | sed -n "s/^__version__[  ]*=[    ]*['\"]\([^'\"]\+\)['\"].*/\1/gp")"
@@ -842,13 +894,12 @@ if [ $BUILD_DEVEL -eq 1 ]; then
     sed -i "s/^__version__[  ]*=.*/__version__ = '${pkg_maj}.${pkg_min}.${pkg_bfx}${pkg_deb}+dev${dt}-${hash}'/g" openquake/engine/__init__.py
 fi
 
-if [  "$ini_maj" != "$pkg_maj" -o "$ini_maj" != "$stp_maj" -o \
-      "$ini_min" != "$pkg_min" -o "$ini_min" != "$stp_min" -o \
-      "$ini_bfx" != "$pkg_bfx" -o "$ini_bfx" != "$stp_bfx" ]; then
+if [  "$ini_maj" != "$pkg_maj" -o \
+      "$ini_min" != "$pkg_min" -o \
+      "$ini_bfx" != "$pkg_bfx" ]; then
     echo
     echo "Versions are not aligned"
     echo "    init:  ${ini_maj}.${ini_min}.${ini_bfx}"
-    echo "    setup: ${stp_maj}.${stp_min}.${stp_bfx}"
     echo "    pkg:   ${pkg_maj}.${pkg_min}.${pkg_bfx}"
     echo
     echo "press [enter] to continue, [ctrl+c] to abort"
@@ -859,12 +910,19 @@ sed -i "s/^\([ ${TB}]*\)[^)]*\()  # release date .*\)/\1${dt}\2/g" openquake/__i
 
 # mods pre-packaging
 mv LICENSE         openquake/engine
-mv README.txt      openquake/engine/README
+mv README.md       openquake/engine/README
 mv celeryconfig.py openquake/engine
 mv openquake.cfg   openquake/engine
 
 dpkg-buildpackage $DPBP_FLAG
 cd -
+
+# if the monotone directory exists and is the "gem" repo and is the "master" branch then ...
+if [ -d "${GEM_DEB_MONOTONE}/source" -a $BUILD_SOURCES_COPY -eq 1 ]; then
+    cp build-deb/${GEM_DEB_PACKAGE}_*.changes \
+        build-deb/${GEM_DEB_PACKAGE}_*.dsc build-deb/${GEM_DEB_PACKAGE}_*.tar.gz \
+        "${GEM_DEB_MONOTONE}/source"
+fi
 
 if [ $BUILD_DEVEL -ne 1 ]; then
     exit 0

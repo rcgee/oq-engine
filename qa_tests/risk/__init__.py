@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -20,6 +20,8 @@ import warnings
 import numpy
 import StringIO
 import shutil
+
+from django.core.exceptions import ObjectDoesNotExist
 
 from qa_tests import _utils as qa_utils
 from openquake.engine.tests.utils import helpers
@@ -57,7 +59,7 @@ class BaseRiskQATestCase(qa_utils.BaseQATestCase):
         :raises:
             :exc:`AssertionError` if the job was not successfully run.
         """
-        completed_job = helpers.run_job(cfg, hazard_output_id=hazard_id)
+        completed_job = helpers.run_job(cfg, hazard_output_id=hazard_id).job
         self.assertEqual('complete', completed_job.status)
 
         return completed_job
@@ -67,7 +69,6 @@ class BaseRiskQATestCase(qa_utils.BaseQATestCase):
         actual_data = self.actual_data(job)
 
         # assert actual_data, 'Got no actual data!'
-
         for i, actual in enumerate(actual_data):
             numpy.testing.assert_allclose(
                 expected_data[i], actual,
@@ -83,11 +84,14 @@ class BaseRiskQATestCase(qa_utils.BaseQATestCase):
         result_dir = tempfile.mkdtemp()
 
         try:
+            haz_job = self.get_hazard_job()
             job = self.run_risk(
                 self._test_path('job_risk.ini'),
-                self.hazard_id(self.get_hazard_job()))
+                self.hazard_id(haz_job))
 
-            self.check_outputs(job)
+            for attr in dir(self):
+                if attr.startswith('check_'):
+                    getattr(self, attr)(job)
 
             if hasattr(self, 'expected_outputs'):
                 expected_outputs = self.expected_outputs()
@@ -162,7 +166,7 @@ class LogicTreeBasedTestCase(object):
             :exc:`AssertionError` if the job was not successfully run.
         """
         completed_job = helpers.run_job(
-            cfg, hazard_calculation_id=hazard_id)
+            cfg, hazard_calculation_id=hazard_id).job
         self.assertEqual('complete', completed_job.status)
 
         return completed_job
@@ -171,7 +175,7 @@ class LogicTreeBasedTestCase(object):
         """
         :returns: the hazard calculation id for the given `job`
         """
-        return job.hazard_calculation.id
+        return job.id
 
 
 class CompleteTestCase(object):
@@ -203,12 +207,17 @@ class CompleteTestCase(object):
                 actual_path = self._test_path("actual/%s.csv" % data_hash)
                 actual_file = open(actual_path, 'w')
                 continue
+            elif data_hash[0] == 'loss_fraction':
+                actual_path = self._test_path("actual/fractions.csv")
+                actual_file = open(actual_path, 'w')
             assert data_hash in outputs, \
                 "The output with hash %s is missing" % str(data_hash)
             actual_output = outputs[data_hash]
-            if actual_file:
-                label = data_hash[-1]  # the asset_ref for LossCurveData
-                actual_file.write(actual_output.to_csv_str(label) + '\n')
+            if actual_file and data_hash[0] == 'loss_fraction':
+                actual_file.write(actual_output.to_csv_str() + '\n')
+            elif actual_file:
+                asset_ref = data_hash[-1]  # the asset_ref for LossCurveData
+                actual_file.write(actual_output.to_csv_str(asset_ref) + '\n')
             try:
                 expected_output.assertAlmostEqual(actual_output)
             except AssertionError:
@@ -244,24 +253,23 @@ class FixtureBasedQATestCase(LogicTreeBasedTestCase, BaseRiskQATestCase):
     # calculation and run the risk calculation from the load one
     save_load = False
 
-    def _get_queryset(self):
-        return models.HazardCalculation.objects.filter(
-            description=self.hazard_calculation_fixture,
-            oqjob__status="complete")
-
     def get_hazard_job(self):
-        if not self._get_queryset().exists():
+        try:
+            job = models.JobParam.objects.filter(
+                name='description',
+                value__contains=self.hazard_calculation_fixture,
+                job__status="complete").latest('id').job
+        except ObjectDoesNotExist:
             warnings.warn("Computing Hazard input from scratch")
             job = helpers.run_job(
-                self._test_path('job_haz.ini'))
+                self._test_path('job_haz.ini')).job
             self.assertEqual('complete', job.status)
         else:
             warnings.warn("Using existing Hazard input")
-            job = self._get_queryset().latest('oqjob__last_update').oqjob
 
         if self.save_load:
             # Close the opened transactions
-            saved_calculation = save_hazards.main(job.hazard_calculation.id)
+            saved_calculation = save_hazards.main(job.id)
 
             # FIXME Here on, to avoid deadlocks due to stale
             # transactions, we commit all the opened transactions. We
@@ -273,7 +281,6 @@ class FixtureBasedQATestCase(LogicTreeBasedTestCase, BaseRiskQATestCase):
 
             [load_calculation] = load_hazards.hazard_load(
                 models.getcursor('admin').connection, saved_calculation)
-            return models.OqJob.objects.get(
-                hazard_calculation__id=load_calculation)
+            return models.OqJob.objects.get(pk=load_calculation)
         else:
             return job

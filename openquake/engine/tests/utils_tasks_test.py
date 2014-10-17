@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010-2012, GEM Foundation.
+# Copyright (c) 2010-2014, GEM Foundation.
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -25,7 +25,8 @@ import unittest
 
 from openquake.engine.utils import tasks
 
-from openquake.engine.tests.utils.tasks import failing_task, just_say_hello
+from openquake.engine.tests.utils.tasks import \
+    failing_task, just_say_hello, get_even
 
 
 class MapReduceTestCase(unittest.TestCase):
@@ -53,8 +54,8 @@ class MapReduceTestCase(unittest.TestCase):
     def test_failing_subtask(self):
         try:
             tasks.parallelize(failing_task, [(42, )], None)
-        except NotImplementedError as exc:
-            self.assertEqual('42', exc.args[0])
+        except RuntimeError as exc:
+            self.assertIn('NotImplementedError: 42', str(exc))
         else:
             raise Exception("Exception not raised.")
 
@@ -64,3 +65,8 @@ class MapReduceTestCase(unittest.TestCase):
                                 lst.append)
         self.assertEqual(res, None)
         self.assertEqual(lst, ['hello'] * 5)
+
+    def test_apply_reduce(self):
+        got = tasks.apply_reduce(
+            get_even, (1, [1, 2, 3, 4, 5]), list.__add__, [], 2)
+        self.assertEqual(sorted(got), [2, 4])
