@@ -212,14 +212,9 @@ def oqtask(task_func):
                     oq_job=job,
                     operation='storing task id',
                     task_id=tsk.request.id).delete()
-<<<<<<< HEAD
     celery_queue = config.get('redis', 'celery_queue')
-    tsk = task(wrapped, queue=celery_queue)
-=======
-    celery_queue = config.get('amqp', 'celery_queue')
     f = lambda *args: safely_call(wrapped, args, pickle=True)
     f.__name__ = task_func.__name__
     tsk = task(f, queue=celery_queue)
->>>>>>> master
     tsk.task_func = task_func
     return tsk
