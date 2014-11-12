@@ -47,7 +47,7 @@ class ExposureDBWriter(object):
         """
         for asset_data in iterator:
             if not self.model:
-                self.model, self.cost_types = self.insert_model(asset_data)
+                self.model, self.cost_types = self.insert_model(exposure_metadata)
             self.insert_datum(asset_data)
         return self.model
 
@@ -66,18 +66,17 @@ class ExposureDBWriter(object):
         """
         exposure_model = models.ExposureModel.objects.create(
             job=self.job,
-            name=model.exposure_id,
+            name=model.id,
             description=model.description,
             taxonomy_source=model.taxonomy_source,
-            category=model.asset_category,
-            area_type=model.conversions.area_type,
-            area_unit=model.conversions.area_unit,
-            deductible_absolute=model.conversions.deductible_is_absolute,
-            insurance_limit_absolute=(
-                model.conversions.insurance_limit_is_absolute))
+            category=model.category,
+            area_type=model.area_type,
+            area_unit=model.area_unit,
+            deductible_absolute=model.deductible_is_absolute,
+            insurance_limit_absolute=model.insurance_limit_is_absolute)
 
         cost_types = {}
-        for cost_type in model.conversions.cost_types:
+        for cost_type in model.cost_types:
             cost_types[cost_type.name] = models.CostType.objects.create(
                 exposure_model=exposure_model,
                 name=cost_type.name,
@@ -113,8 +112,7 @@ class ExposureDBWriter(object):
 
         model = asset_data.exposure_metadata
         deductible_is_absolute = model.conversions.deductible_is_absolute
-        insurance_limit_is_absolute = (
-            model.conversions.insurance_limit_is_absolute)
+        insurance_limit_is_absolute = model.insurance_limit_is_absolute
 
         for cost in asset_data.costs:
             cost_type = self.cost_types.get(cost.cost_type, None)
@@ -136,9 +134,9 @@ class ExposureDBWriter(object):
             converted_cost = models.ExposureData.per_asset_value(
                 cost.value, cost_type.conversion,
                 asset_data.area,
-                model.conversions.area_type,
-                asset_data.number,
-                model.asset_category)
+                model.area_type,
+                asset_data['number'],
+                model.category)
 
             models.Cost.objects.create(
                 exposure_data=asset,

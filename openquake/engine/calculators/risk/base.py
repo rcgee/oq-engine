@@ -200,7 +200,7 @@ class RiskCalculator(base.Calculator):
         exposure = self.rc.exposure_model
         if exposure is None:
             with self.monitor('import exposure'):
-                exposure = readinput.get_exposure(self.hc)
+                exposure = readinput.get_exposure(self.rc)
                 ExposureDBWriter(self.job).serialize(
                     exposure.assets, exposure)
 
