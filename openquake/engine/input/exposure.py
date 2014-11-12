@@ -40,15 +40,14 @@ class ExposureDBWriter(object):
         self.cost_types = {}
 
     @transaction.commit_on_success(router.db_for_write(models.ExposureModel))
-    def serialize(self, iterator):
+    def serialize(self, iterator, exposure_metadata):
         """
         Serialize a list of values produced by iterating over an instance of
         :class:`openquake.commonlib.risk_parsers.ExposureParser`
         """
         for asset_data in iterator:
             if not self.model:
-                self.model, self.cost_types = (
-                    self.insert_model(asset_data.exposure_metadata))
+                self.model, self.cost_types = self.insert_model(asset_data)
             self.insert_datum(asset_data)
         return self.model
 

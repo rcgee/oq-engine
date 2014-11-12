@@ -24,7 +24,7 @@ import psutil
 
 from django.db import transaction
 
-from openquake.commonlib import risk_parsers
+from openquake.commonlib import readinput
 from openquake.hazardlib.imt import from_string
 from openquake.commonlib.riskmodels import get_vfs
 from openquake.risklib.workflows import Workflow
@@ -200,9 +200,10 @@ class RiskCalculator(base.Calculator):
         exposure = self.rc.exposure_model
         if exposure is None:
             with self.monitor('import exposure'):
+                exposure = readinput.get_exposure(self.hc)
                 ExposureDBWriter(self.job).serialize(
-                    risk_parsers.ExposureModelParser(
-                        self.rc.inputs['exposure']))
+                    exposure.assets, exposure)
+
         self.taxonomies_asset_count = \
             self.rc.exposure_model.taxonomies_in(self.rc.region_constraint)
 
