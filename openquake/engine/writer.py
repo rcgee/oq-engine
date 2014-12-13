@@ -22,6 +22,7 @@ Base classes for the output methods of the various codecs.
 import logging
 import weakref
 import atexit
+import threading
 from cStringIO import StringIO
 
 from django.db import transaction
@@ -33,7 +34,7 @@ from django.contrib.gis.geos.point import Point
 LOGGER = logging.getLogger('serializer')
 
 
-class CacheInserter(object):
+class CacheInserter(threading.local):
     """
     Bulk insert bunches of Django objects by converting them in strings
     and by using COPY FROM.

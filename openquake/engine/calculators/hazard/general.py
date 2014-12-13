@@ -54,9 +54,14 @@ from openquake.engine.utils import tasks
 
 QUANTILE_PARAM_NAME = "QUANTILE_LEVELS"
 POES_PARAM_NAME = "POES"
+
 # Dilation in decimal degrees (http://en.wikipedia.org/wiki/Decimal_degrees)
 # 1e-5 represents the approximate distance of one meter at the equator.
 DILATION_ONE_METER = 1E-5
+
+# the following is arbitrary, set by Michele Simionato, it is used
+# to decide when to parallelize the filtering
+LOTS_OF_SITES = 1000
 
 
 class InputWeightLimit(Exception):
@@ -263,8 +268,9 @@ class BaseHazardCalculator(base.Calculator):
         trees. Save in the database LtSourceModel and TrtModel objects.
         """
         logs.LOG.progress("initializing sources")
+        parallel_filtering = len(self.site_collection) > LOTS_OF_SITES
         self.composite_model = readinput.get_composite_source_model(
-            self.hc, self.site_collection)
+            self.hc, self.site_collection, parallel_filtering)
         for sm in self.composite_model:
             # create an LtSourceModel for each distinct source model
             lt_model = models.LtSourceModel.objects.create(

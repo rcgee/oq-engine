@@ -18,12 +18,37 @@ Core functionality for the classical tilint PSHA hazard calculator.
 """
 import math
 from openquake.baselib.general import split_in_blocks
-from openquake.commonlib import readinput
 from openquake.hazardlib.site import SiteCollection
+from openquake.commonlib import readinput
+from openquake.commonlib import parallel
 
 from openquake.engine.calculators import calculators
 from openquake.engine.calculators.hazard.general import BaseHazardCalculator
-from openquake.engine.logs import LOG
+from openquake.engine.utils import config
+
+from multiprocessing.dummy import Pool, cpu_count
+
+POOLSIZE = cpu_count()
+threadpool = Pool(POOLSIZE)
+
+TASKS_PER_TILE = (int(config.get('celery', 'concurrent_tasks')) //
+                  parallel.executor._max_workers)
+
+
+def run_tile((job, i, tile)):
+    """
+    :param i: ordinal number of the tile being processed (from 1)
+    :param tile: list of sites being processed
+    """
+    classical = calculators['classical'](job)
+    classical.concurrent_tasks = TASKS_PER_TILE
+    classical.tilepath = ('tile%d' % i,)
+    classical.site_collection = SiteCollection(tile)
+    classical.initialize_sources()
+    classical.init_zeros_ones()
+    classical.execute()
+    classical.post_execute()
+    classical.post_process()
 
 
 @calculators.add('classical_tiling')
@@ -31,21 +56,6 @@ class ClassicalTilingHazardCalculator(BaseHazardCalculator):
     """
     Classical tiling PSHA hazard calculator.
     """
-
-    def run_tile(self, i, tile):
-        """
-        :param i: ordinal number of the tile being processed (from 1)
-        :param tile: list of sites being processed
-        """
-        classical = calculators['classical'](self.job)
-        classical.tilepath = ('tile%d' % i,)
-        classical.site_collection = SiteCollection(tile)
-        classical.initialize_sources()
-        classical.init_zeros_ones()
-        classical.execute()
-        classical.post_execute()
-        classical.post_process()
-
     def pre_execute(self):
         """
         Read the full source model and sites and build the needed tiles
@@ -68,10 +78,9 @@ class ClassicalTilingHazardCalculator(BaseHazardCalculator):
         """
         Executing all tiles sequentially
         """
-        for i, tile in enumerate(self.tiles, 1):
-            LOG.progress('Running tile %d of %d, %s sites',
-                         i, self.num_tiles, len(tile))
-            self.run_tile(i, tile)
+        args = ((self.job, i, tile)
+                for i, tile in enumerate(self.tiles, 1))
+        threadpool.map(run_tile, args)
 
     def post_execute(self):
         """Do nothing"""

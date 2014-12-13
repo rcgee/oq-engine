@@ -24,7 +24,6 @@ class EnginePerformanceMonitor(PerformanceMonitor):
     # to that aim extract the pid with
     # connections['job_init'].cursor().connection.get_backend_pid()
 
-    # globals per process
     cache = CacheInserter(models.Performance, 1000)  # store at most 1k objects
 
     @classmethod
