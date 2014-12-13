@@ -157,6 +157,7 @@ class BaseHazardCalculator(base.Calculator):
             (self.job.id, list(self.composite_model.sources),
              self.site_collection),
             agg=self.agg_curves, acc=self.acc,
+            concurrent_tasks=self.concurrent_tasks,
             weight=attrgetter('weight'), key=attrgetter('trt_model_id'))
 
     @EnginePerformanceMonitor.monitor

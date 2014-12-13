@@ -25,18 +25,18 @@ from openquake.commonlib import parallel
 from openquake.engine.calculators import calculators
 from openquake.engine.calculators.hazard.general import BaseHazardCalculator
 from openquake.engine.utils import config
+from openquake.engine.logs import LOG
 
-from multiprocessing.dummy import Pool, cpu_count
+from multiprocessing.dummy import Pool
 
-POOLSIZE = cpu_count()
-threadpool = Pool(POOLSIZE)
+POOLSIZE =  16
 
-TASKS_PER_TILE = (int(config.get('celery', 'concurrent_tasks')) //
-                  parallel.executor._max_workers)
+TASKS_PER_TILE = int(config.get('celery', 'concurrent_tasks')) // POOLSIZE
 
 
 def run_tile((job, i, tile)):
     """
+    :param job: the current job
     :param i: ordinal number of the tile being processed (from 1)
     :param tile: list of sites being processed
     """
@@ -73,6 +73,7 @@ class ClassicalTilingHazardCalculator(BaseHazardCalculator):
         nblocks = math.ceil(weight / self.oqparam.maximum_tile_weight)
         self.tiles = list(split_in_blocks(self.site_collection, nblocks))
         self.num_tiles = len(self.tiles)
+        LOG.info('Produced %d tiles', self.num_tiles)
 
     def execute(self):
         """
@@ -80,7 +81,7 @@ class ClassicalTilingHazardCalculator(BaseHazardCalculator):
         """
         args = ((self.job, i, tile)
                 for i, tile in enumerate(self.tiles, 1))
-        threadpool.map(run_tile, args)
+        Pool(POOLSIZE).map(run_tile, args)
 
     def post_execute(self):
         """Do nothing"""
