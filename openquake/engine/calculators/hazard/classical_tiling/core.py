@@ -16,36 +16,44 @@
 """
 Core functionality for the classical tilint PSHA hazard calculator.
 """
-import math
-from openquake.baselib.general import split_in_blocks
-from openquake.hazardlib.site import SiteCollection
-from openquake.commonlib import readinput
-from openquake.commonlib import parallel
-
-from openquake.engine.calculators import calculators
-from openquake.engine.calculators.hazard.general import BaseHazardCalculator
-from openquake.engine.utils import config
-from openquake.engine.logs import LOG
-
 from multiprocessing.dummy import Pool
 
-POOLSIZE =  16
+from django.db import transaction
 
-TASKS_PER_TILE = int(config.get('celery', 'concurrent_tasks')) // POOLSIZE
+from openquake.baselib.general import split_in_blocks, AccumDict
+from openquake.hazardlib.site import SiteCollection
+
+from openquake.engine.db import models
+from openquake.engine.calculators import calculators
+from openquake.engine.calculators.hazard.general import BaseHazardCalculator
+from openquake.engine.logs import LOG
+
+POOLSIZE = 16
+
+NTILES = 10
 
 
-def run_tile((job, i, tile)):
+def pre_execute((job, i, tile)):
     """
     :param job: the current job
     :param i: ordinal number of the tile being processed (from 1)
     :param tile: list of sites being processed
     """
     classical = calculators['classical'](job)
-    classical.concurrent_tasks = TASKS_PER_TILE
     classical.tilepath = ('tile%d' % i,)
     classical.site_collection = SiteCollection(tile)
+    classical.parallel_filtering = False
     classical.initialize_sources()
+    classical.parse_risk_model()
+    return classical
+
+
+def run_calc(classical):
+    """
+    """
     classical.init_zeros_ones()
+    # reduce the number of tasks for calculations with a small relative weight
+    classical.concurrent_tasks *= classical.weight * NTILES
     classical.execute()
     classical.post_execute()
     classical.post_process()
@@ -60,28 +68,34 @@ class ClassicalTilingHazardCalculator(BaseHazardCalculator):
         """
         Read the full source model and sites and build the needed tiles
         """
-        self.oqparam = self.job.get_oqparam()
-        source_model_lt = readinput.get_source_model_lt(self.oqparam)
-        source_models = list(readinput.get_source_models(
-            self.oqparam, source_model_lt))
-        self.parse_risk_model()
-        self.initialize_site_collection()
-        info = readinput.get_job_info(
-            self.oqparam, source_models, self.site_collection)
-        self.imtls = self.oqparam.imtls
-        weight = info['n_sites'] * info['n_levels'] * info['max_realizations']
-        nblocks = math.ceil(weight / self.oqparam.maximum_tile_weight)
-        self.tiles = list(split_in_blocks(self.site_collection, nblocks))
+        with transaction.commit_on_success(using='job_init'):
+            self.initialize_site_collection()
+        self.tiles = list(split_in_blocks(self.site_collection, NTILES))
         self.num_tiles = len(self.tiles)
         LOG.info('Produced %d tiles', self.num_tiles)
+        args = ((self.job, i, tile)
+                for i, tile in enumerate(self.tiles, 1))
+        #for conn in connections.all():
+        #    conn.close()
+        self.calculators = Pool(POOLSIZE).map(pre_execute, args)
+        info = sum((AccumDict(calc.info) for calc in self.calculators), {})
+        for calc in self.calculators:
+            calc.weight = info['output_weight'] / calc.info['output_weight']
+        with transaction.commit_on_success(using='job_init'):
+            models.JobInfo.objects.create(
+                oq_job=self.job,
+                num_sites=info['n_sites'],
+                num_realizations=info['max_realizations'],
+                num_imts=info['n_imts'],
+                num_levels=info['n_levels'],
+                input_weight=info['input_weight'],
+                output_weight=info['output_weight'])
 
     def execute(self):
         """
         Executing all tiles sequentially
         """
-        args = ((self.job, i, tile)
-                for i, tile in enumerate(self.tiles, 1))
-        Pool(POOLSIZE).map(run_tile, args)
+        Pool(POOLSIZE).map(run_calc, self.calculators)
 
     def post_execute(self):
         """Do nothing"""

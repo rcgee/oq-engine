@@ -208,8 +208,7 @@ class BaseHazardCalculator(base.Calculator):
             self.initialize_site_collection()
         with transaction.commit_on_success(using='job_init'):
             self.initialize_sources()
-        info = readinput.get_job_info(
-            self.hc, self.composite_model, self.site_collection)
+        info = self.info
         with transaction.commit_on_success(using='job_init'):
             models.JobInfo.objects.create(
                 oq_job=self.job,
@@ -267,11 +266,11 @@ class BaseHazardCalculator(base.Calculator):
         """
         Parse source models, apply uncertainties and validate source logic
         trees. Save in the database LtSourceModel and TrtModel objects.
+        Store the calculation information in self.info.
         """
         logs.LOG.progress("initializing sources")
-        parallel_filtering = len(self.site_collection) > LOTS_OF_SITES
         self.composite_model = readinput.get_composite_source_model(
-            self.hc, self.site_collection, parallel_filtering)
+            self.hc, self.site_collection, self.parallel_filtering)
         for sm in self.composite_model:
             # create an LtSourceModel for each distinct source model
             lt_model = models.LtSourceModel.objects.create(
@@ -290,6 +289,10 @@ class BaseHazardCalculator(base.Calculator):
                     min_mag=trt_mod.min_mag,
                     max_mag=trt_mod.max_mag,
                     gsims=trt_mod.gsims).id
+
+        # compute the calculation weights
+        self.info = readinput.get_job_info(
+            self.hc, self.composite_model, self.site_collection)
 
     @EnginePerformanceMonitor.monitor
     def parse_risk_model(self):
@@ -328,6 +331,7 @@ class BaseHazardCalculator(base.Calculator):
             sm_params = None
         self.site_collection = get_site_collection(
             oqparam, points, site_ids, sm_params)
+        self.parallel_filtering = len(self.site_collection) > LOTS_OF_SITES
 
     def initialize_realizations(self):
         """
