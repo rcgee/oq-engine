@@ -16,9 +16,9 @@
 """
 Core functionality for the classical tilint PSHA hazard calculator.
 """
-from multiprocessing.dummy import Pool
+from multiprocessing import Pool
 
-from django.db import transaction
+from django import db
 
 from openquake.baselib.general import split_in_blocks, AccumDict
 from openquake.hazardlib.site import SiteCollection
@@ -32,29 +32,37 @@ POOLSIZE = 16
 
 NTILES = 10
 
+Classical = calculators['classical']
 
-def pre_execute((job, i, tile)):
+
+def make_calculators((job, i, tile)):
     """
     :param job: the current job
     :param i: ordinal number of the tile being processed (from 1)
     :param tile: list of sites being processed
     """
-    classical = calculators['classical'](job)
-    classical.tilepath = ('tile%d' % i,)
+    classical = Classical(job)
+    classical.parse_risk_model()
+    classical.tilepath = ('_tile%d' % i,)
     classical.site_collection = SiteCollection(tile)
     classical.parallel_filtering = False
     classical.initialize_sources()
-    classical.parse_risk_model()
     return classical
 
 
-def run_calc(classical):
+def execute(classical):
     """
     """
     classical.init_zeros_ones()
     # reduce the number of tasks for calculations with a small relative weight
     classical.concurrent_tasks *= classical.weight * NTILES
     classical.execute()
+    return classical
+
+
+def post_execute(classical):
+    models.OqJob.get_or_create_output.__func__.__defaults__ = (
+        classical.tilepath)
     classical.post_execute()
     classical.post_process()
 
@@ -68,20 +76,21 @@ class ClassicalTilingHazardCalculator(BaseHazardCalculator):
         """
         Read the full source model and sites and build the needed tiles
         """
-        with transaction.commit_on_success(using='job_init'):
+        with db.transaction.commit_on_success(using='job_init'):
             self.initialize_site_collection()
         self.tiles = list(split_in_blocks(self.site_collection, NTILES))
         self.num_tiles = len(self.tiles)
         LOG.info('Produced %d tiles', self.num_tiles)
         args = ((self.job, i, tile)
                 for i, tile in enumerate(self.tiles, 1))
-        #for conn in connections.all():
-        #    conn.close()
-        self.calculators = Pool(POOLSIZE).map(pre_execute, args)
+        db.close_connection()
+        self.pool = Pool(POOLSIZE)
+        self.calculators = self.pool.map(make_calculators, args)
         info = sum((AccumDict(calc.info) for calc in self.calculators), {})
         for calc in self.calculators:
+            # set the relative weight of each tile
             calc.weight = info['output_weight'] / calc.info['output_weight']
-        with transaction.commit_on_success(using='job_init'):
+        with db.transaction.commit_on_success(using='job_init'):
             models.JobInfo.objects.create(
                 oq_job=self.job,
                 num_sites=info['n_sites'],
@@ -95,10 +104,13 @@ class ClassicalTilingHazardCalculator(BaseHazardCalculator):
         """
         Executing all tiles sequentially
         """
-        Pool(POOLSIZE).map(run_calc, self.calculators)
+        self.calculators = self.pool.map(execute, self.calculators)
 
     def post_execute(self):
         """Do nothing"""
+        self.pool.map(post_execute, self.calculators)
 
     def post_process(self):
         """Do nothing"""
+        self.pool.close()
+        self.pool.join()

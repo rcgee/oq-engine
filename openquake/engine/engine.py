@@ -116,6 +116,7 @@ def job_stats(job):
         job.save()
 
         # save job stats
+        curs = models.getcursor('job_init')
         curs.execute("select pg_database_size(%s)", (dbname,))
         new_dbsize = curs.fetchall()[0][0]
         js.disk_space = new_dbsize - dbsize

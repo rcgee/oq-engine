@@ -29,6 +29,7 @@ import os
 import re
 import collections
 import operator
+import multiprocessing
 from datetime import datetime
 
 
@@ -36,7 +37,7 @@ import numpy
 from scipy import interpolate
 
 from django.db import connections, transaction
-from django.core.exceptions import ObjectDoesNotExist
+from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
 
 from django.contrib.gis.db import models as djm
 
@@ -308,20 +309,14 @@ class OqJob(djm.Model):
         # is not null and contains a reference to the previous hazard job
         return 'hazard' if self.hazard_calculation is None else 'risk'
 
-    def get_or_create_output(self, display_name, output_type):
+    def get_or_create_output(self, display_name, output_type, tile=''):
         """
         :param disp_name: display name of the output
         :param output_type: the output type
         :returns: an Output instance
         """
-        try:
-            output = Output.objects.get(
-                oq_job=self, display_name=display_name,
-                output_type=output_type)
-        except ObjectDoesNotExist:
-            output = Output.objects.create_output(
-                self, display_name, output_type)
-        return output
+        return Output.objects.create_output(
+            self, display_name + tile, output_type)
 
     def get_param(self, name, missing=RAISE_EXC):
         """
