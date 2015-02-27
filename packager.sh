@@ -335,7 +335,10 @@ celeryd_wait $GEM_MAXLOOP"
         scp "${lxc_ip}:oq-engine/coverage.xml" .
     else
         if [ -d $HOME/fake-data/oq-engine ]; then
-            cp $HOME/fake-data/oq-engine/* .
+            bname="$(dirname $WORKSPACE)/builds/$BUILD_ID"
+            cp -r $HOME/fake-data/oq-engine/* .
+            rm -rf "${bname}/violations"
+            cp -r $HOME/fake-data/oq-engine/violations "$bname"
         fi
     fi
 
