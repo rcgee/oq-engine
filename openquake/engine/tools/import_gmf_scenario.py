@@ -171,7 +171,6 @@ def import_gmf_scenario(fileobj):
             hazard_imtls=dict.fromkeys(imts),
             inputs={},
             number_of_ground_motion_fields=len(rows) // len(imts),
-            maximum_distance=1000.,
             ))
 
     job.duration = time.time() - t0
