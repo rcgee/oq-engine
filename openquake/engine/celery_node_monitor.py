@@ -76,19 +76,19 @@ class CeleryNodeMonitor(object):
 
     :param float interval:
         polling interval in seconds
-    :param bool no_distribute:
-        if True, the CeleryNodeMonitor will do nothing at all
+    :param bool use_celery:
+        if False, the CeleryNodeMonitor will do nothing at all
     """
-    def __init__(self, no_distribute, interval):
+    def __init__(self, use_celery, interval):
+        self.use_celery = use_celery
         self.interval = interval
-        self.no_distribute = no_distribute
         self.job_running = True
         self.live_nodes = None  # set of live worker nodes
         self.th = None
         MasterKilled.register_handlers()
 
     def __enter__(self):
-        if self.no_distribute:
+        if not self.use_celery:
             return self  # do nothing
         self.live_nodes = self.ping(timeout=1)
         if not self.live_nodes:

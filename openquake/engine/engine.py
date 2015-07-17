@@ -57,6 +57,8 @@ UNABLE_TO_DEL_RC_FMT = 'Unable to delete risk calculation: %s'
 TERMINATE = valid.boolean(
     config.get('celery', 'terminate_workers_on_revoke') or 'false')
 
+MODE = config.get('general', 'mode') or 'singlemachine'
+
 
 class InvalidHazardCalculationID(Exception):
     pass
@@ -366,7 +368,7 @@ def run_job(cfg_file, log_level, log_file, exports='', hazard_output_id=None,
     """
     # first of all check the database version and exit if the db is outdated
     upgrader.check_versions(django_db.connections['admin'])
-    with CeleryNodeMonitor(openquake.engine.no_distribute(), interval=3):
+    with CeleryNodeMonitor(MODE == 'cluster', interval=3):
         job = job_from_file(
             cfg_file, getpass.getuser(), log_level, exports,
             hazard_output_id, hazard_calculation_id)

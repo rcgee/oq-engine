@@ -98,3 +98,10 @@ class EnginePerformanceMonitor(PerformanceMonitor):
             pgmemory=None)
         self.mem = 0
         self.duration = 0
+
+
+from openquake.engine.utils import config
+if config.get('general', 'mode') != 'cluster':
+    from openquake.commonlib import parallel
+    EnginePerformanceMonitor = parallel.PerformanceMonitor
+    EnginePerformanceMonitor.monitor = staticmethod(lambda f: f)
