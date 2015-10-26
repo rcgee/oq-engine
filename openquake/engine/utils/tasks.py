@@ -20,7 +20,7 @@
 
 from celery.result import ResultSet
 from celery.app import current_app
-from celery.task import task
+from celery.task import task, Task
 
 from openquake.hazardlib.gsim.base import GroundShakingIntensityModel
 from openquake.commonlib.parallel import \
@@ -53,8 +53,11 @@ class OqTaskManager(TaskManager):
     progress = staticmethod(logs.LOG.progress)
 
     def _submit(self, pickled_args):
-        # submit tasks by using celery
-        return self.oqtask.delay(*pickled_args)
+        if hasattr(self.oqtask, 'delay'):
+            # submit tasks by using celery
+            return self.oqtask.delay(*pickled_args)
+        else:
+            return TaskManager._submit(self, pickled_args)
 
     def aggregate_result_set(self, agg, acc):
         """
@@ -65,6 +68,8 @@ class OqTaskManager(TaskManager):
         :param acc: the initial value of the accumulator
         :returns: the final value of the accumulator
         """
+        if not isinstance(self.oqtask, Task):
+            return TaskManager.aggregate_result_set(self, agg, acc)
         if not self.results:
             return acc
         backend = current_app().backend
@@ -148,4 +153,6 @@ from openquake.commonlib import parallel
 # monkey patch the parallel module
 parallel.starmap = starmap
 parallel.apply_reduce = apply_reduce
-parallel.litetask = oqtask
+if not config.get('celery', 'terminate_workers_on_revoke'):
+    # in a cluster situation
+    parallel.litetask = oqtask
