@@ -70,6 +70,9 @@ from openquake.engine.calculators.hazard import general
 from openquake.engine.db import models
 from openquake.engine.utils import tasks
 
+from openquake.calculators.classical_rupture import RuptureCalculator
+from openquake.engine import engine
+from openquake.engine.performance import EnginePerformanceMonitor
 
 inserter = writer.CacheInserter(models.SourceInfo, 100)
 
@@ -302,3 +305,22 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
                 for site in self.site_collection
                 for lt_model in lt_models)
         return weights
+
+
+@calculators.add('classical_rupture')
+class ClassicalRuptureCalculator(RuptureCalculator):
+    """
+    ClassicalRupture hazard calculator. Computes ground motion fields.
+    """
+    def __init__(self, job):
+        self.job = job
+        oq = job.get_oqparam()
+        monitor = EnginePerformanceMonitor('classical_rupture', job.id)
+        calc_id = engine.get_calc_id(job.id)
+        super(ClassicalRuptureCalculator, self).__init__(oq, monitor, calc_id)
+        job.ds_calc_dir = self.datastore.calc_dir
+        job.save()
+
+    def clean_up(self):
+        engine.expose_outputs(self.datastore, self.job)
+        super(ClassicalRuptureCalculator, self).clean_up()
