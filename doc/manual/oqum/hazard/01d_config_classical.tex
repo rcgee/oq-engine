@@ -204,14 +204,21 @@ maximum_distance = {'Stable Continental Crust': 150.0,
                     'Active Shallow Crust': 200.0}
 \end{minted}
 
-An even more advanced approach is to use a maximum distance depending on the
-magnitude (magnitude-distance filter): in that case the user must specify
-the maximum distance per a discrete set of magnitudes. Here is an
-example:
+An even more advanced approach is to specify a maximum distance threshold
+depending on the magnitude (magnitude-distance filter). The purpose is to
+filter out ruptures above a certain magnitude when they do not fall within a
+specific distance threshold. This allows distant ruptures - those that are too
+far away to contribute to the hazard at a site - to be excluded from the
+computation. In this case the the user must specify a discrete set of
+magnitudes, and for each, a maximum distance. This is the distance outside
+which ruptures greater than the associated magntiude are discarded. An example
+is shown below where, for Stable Continental Crust, magnitudes above 8 are
+discarded outside 300 km, magnitudes above 7 are discarded outside 200 km,
+and magnitudes above 5 are discarded outside 150 km.
 
 \begin{minted}[fontsize=\footnotesize,frame=single,bgcolor=lightgray]{ini}
-maximum_distance = {'Stable Continental Crust': [(8, 250), (7, 150), (5, 50)],
-                    'Active Shallow Crust': [(8, 300), (7, 200), (5, 100)]}
+maximum_distance = {'Stable Continental Crust': [(8, 300), (7, 200), (5, 100)],
+                    'Active Shallow Crust': [(8, 250), (7, 150), (5, 50)]}
 \end{minted}
 
 You should read this example as follows: for Stable Continental Crust
