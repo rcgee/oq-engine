@@ -53,6 +53,25 @@ disaggregation matrix computed. \texttt{num\_epsilon\_bins} indicates the
 number of bins used to represent the contributions provided by different
 values of epsilon.
 
+It is also possible to perform disaggregation by directly specifying a single
+intensity measure level to be disaggregated. This can be done by replacing
+\texttt{poes\_disagg} and associated probabilities with \texttt{iml\_disagg}
+and the associated intensity measure level (g). This is a useful feature if
+a user wants to perform disaggregation of a hazard model that contains multiple
+logic tree branches and the user is interested in disaggregating, for example,
+the mean hazard or a specific quantile. An example of a possible workflow is
+the following: compute the desired hazard curve (mean or quantile) using the
+classical PSHA hazard calculator, extract from the curve the intensity measure
+corresponding to the desired hazard level to be disaggregated, then specify
+that intensity measure level using \texttt{iml\_disagg}. Note that
+\texttt{poes\_disagg} cannot be set if \texttt{iml\_disagg} is set and vice-versa. 
+An example is shown below:
+
+\begin{minted}[firstline=1,linenos=true,firstnumber=5,fontsize=\footnotesize,frame=single,bgcolor=lightgray]{ini}
+[disaggregation]
+iml_disagg = 0.3
+\end{minted}
+
 If the user is interested in a specific type of disaggregation, we suggest to
 use a very coarse gridding for the parameters that are  not necessary. For
 example, if the user is interested in a magnitude-distance  disaggregation, we
